@@ -1,363 +1,357 @@
-
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Deque
 import os
 import pathlib
 import re
+import logging
+import time
+import textwrap
+from collections import deque
+from difflib import SequenceMatcher
 
-from config.settings import settings
+from config.settings import settings, confidence_thresholds
 from .retriever import Retriever
-from adapters.llm.openai_client import chat_complete  # ✅ Your wrapper
+from adapters.llm.openai_client import chat_complete
 
-# Optional fallback readers
-try:
-    from docx import Document  # python-docx
-except Exception:
-    Document = None
+logger = logging.getLogger(__name__)
 
-try:
-    from PyPDF2 import PdfReader  # pypdf2
-except Exception:
-    PdfReader = None
+# ==================== CONSTANTS ====================
+MAX_PROMPT_CHARS = 12000
+MAX_MEMORY_CHARS = 2000
+MAX_SUMMARY_CHARS = 1000
+WRAP_WIDTH = int(os.getenv("WHATSAPP_WRAP_WIDTH", "0"))  # 0 = no wrap
 
+# ==================== Special Messages ====================
+SPECIAL_MESSAGES = {
+    "greetings": ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"],
+    "farewells": ["bye", "goodbye", "see you", "later"],
+    "thanks": ["thanks", "thank you", "thx"],
+    "exit": ["stop", "exit", "end chat", "reset", "cancel"],
+}
 
-# -------- Prompts --------
+# ==================== Special Message Checker ====================
+def check_special_message(text: str, session_user_turns: int = 0) -> Optional[Dict[str, str]]:
+    """
+    Detects greetings, farewells, thanks, and exit commands.
+    Exit continuity note only shows if user has had >2 messages in this session.
+    """
+    msg = text.strip().lower()
+
+    # ----------------- EXIT -----------------
+    exit_commands = SPECIAL_MESSAGES["exit"]
+    if any(msg == word or msg.startswith(word + " ") or msg.endswith(" " + word) for word in exit_commands):
+        msg_text = "Goodbye!"
+        if session_user_turns > 2:
+            msg_text += " Your conversation has been ended. Feel free to start a new chat anytime."
+        return {"intent": "exit", "text": msg_text}
+
+    # ----------------- GREETINGS -----------------
+    greetings = SPECIAL_MESSAGES["greetings"]
+    best_match = max(greetings, key=lambda g: SequenceMatcher(None, g, msg).ratio(), default=None)
+    if best_match and SequenceMatcher(None, best_match, msg).ratio() > 0.7:
+        return {"intent": "greeting", "text": f"Hello there! 👋 How are you doing today?"}
+
+    # ----------------- FAREWELLS -----------------
+    farewells = SPECIAL_MESSAGES["farewells"]
+    best_match = max(farewells, key=lambda f: SequenceMatcher(None, f, msg).ratio(), default=None)
+    if best_match and SequenceMatcher(None, best_match, msg).ratio() > 0.7:
+        return {"intent": "farewell", "text": "Goodbye! Take care and chat with us anytime."}
+
+    # ----------------- THANKS -----------------
+    thanks = SPECIAL_MESSAGES["thanks"]
+    best_match = max(thanks, key=lambda t: SequenceMatcher(None, t, msg).ratio(), default=None)
+    if best_match and SequenceMatcher(None, best_match, msg).ratio() > 0.7:
+        return {"intent": "thanks", "text": "You're welcome! Happy to assist you. 😊"}
+
+    return None
+
+# ==================== System Prompt ====================
 def _load_system_prompt() -> str:
-    """
-    Brand-safe system prompt: concise answers, no internal references.
-    """
     brand = os.getenv("COMEMR_BRAND_NAME", getattr(settings, "COMEMR_BRAND_NAME", "ComEMR Support"))
     try:
-        base = pathlib.Path("prompts") / "system.txt"
-        if base.exists():
-            return base.read_text(encoding="utf-8").strip()
+        prompt_file = pathlib.Path("prompts") / "system.txt"
+        if prompt_file.exists():
+            return prompt_file.read_text(encoding="utf-8").strip()
     except Exception:
         pass
+    return f"""You are {brand}, an AI assistant for the ComEMR healthcare platform.
 
-    return (
-        f"You are {brand}. Provide accurate, concise answers in plain language.\n"
-        "- Do NOT mention internal systems (KB, indexes, vector DB, files, paths) or scores.\n"
-        "- Do NOT include citations inline. If context is insufficient, say you don't know and "
-        "suggest safe next steps.\n"
-        "- Prefer numbered steps for procedures. Keep patient privacy and data security.\n"
-        "- Avoid clinical diagnosis/treatment instructions; direct users to local protocols or "
-        "licensed clinicians when needed.\n"
-        "- Never reveal secrets, tokens, passwords, or private configuration.\n"
-    )
+CORE RULES:
+- Answer ONLY questions about ComEMR/SPICE features, workflows, troubleshooting, and user support.
+- ALWAYS ground your answers in the provided information without mentioning it explicitly.
+- NEVER mention internal systems, documents, or sources.
+- If unsure, be honest and suggest contacting support.
 
+STYLE:
+- WhatsApp-friendly
+- Use short headings (## Heading)
+- Numbered steps and bullet points
+- Short paragraphs (1–3 lines)
+"""
 
-# -------- Guardrails --------
-def _default_guardrails(user_query: str, enabled: bool) -> Tuple[bool, str]:
-    if not enabled:
-        return False, ""
-
-    q = (user_query or "").lower()
-
-    # Only block attempts to REVEAL or SHARE secrets; do not block normal support questions
-    sensitive_terms = ("api key", "token", "private key", "secret", "credential")
-    reveal_verbs = ("share", "reveal", "show", "give", "expose", "send", "post")
-
-    for st in sensitive_terms:
-        if st in q:
-            for v in reveal_verbs:
-                if v in q:
-                    return True, (
-                        "For security, I can’t assist with requests that expose credentials or secrets. "
-                        "Please share non‑sensitive details or ask for official guidance."
-                    )
-
-    # Block revealing passwords
-    if "password" in q and any(v in q for v in reveal_verbs):
-        return True, (
-            "For safety and privacy, I can’t help reveal or transmit passwords. "
-            "I can provide official steps to reset or change a password."
-        )
-
-    # Soft guard for clinical treatment/diagnosis — don’t block, but redirect safely
-    clinical_terms = ("treat", "diagnose", "dose", "prescribe", "medication", "convuls", "seizure")
-    if any(t in q for t in clinical_terms):
-        return False, ""  # allow, but the prompt instructs safe redirection
-
-    return False, ""
-
-
-# -------- Context utilities --------
-def _truncate_context(chunks: List[Dict[str, Any]], max_chars: int) -> List[Dict[str, Any]]:
-    total = 0
-    kept = []
-    for ch in chunks:
-        txt = ch.get("text") or ch.get("chunk_text") or ""
-        ln = len(txt)
-        if ln == 0:
-            continue
-        if total + ln <= max_chars:
-            kept.append(ch)
-            total += ln
-        else:
-            # allow small overflow to keep last whole chunk if it’s short
-            if ln < 600 and total + ln <= max_chars + 600:
-                kept.append(ch)
-            break
-    return kept
-
-
-def _format_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cites = []
-    for i, ch in enumerate(chunks, start=1):
-        cites.append({
-            "id": ch.get("id") or ch.get("chunk_id") or f"chunk-{i}",
-            "title": ch.get("title"),
-            "source_path": ch.get("source_path"),
-            "chunk_id": ch.get("chunk_id", i),
-            "score": ch.get("score"),
-            "rank": ch.get("rank", i),
-        })
-    return cites
-
-
-# -------- File-system fallback (KB folder scan: .docx, .pdf) --------
-KB_DIR = os.getenv("KB_DIR", "KB")  # set to your KB folder name (e.g., 'KB' or 'kb')
-
-def _read_docx(path: pathlib.Path) -> str:
-    if Document is None:
-        return ""
-    try:
-        doc = Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs if p.text).strip()
-    except Exception:
-        return ""
-
-def _read_pdf(path: pathlib.Path) -> str:
-    if PdfReader is None:
-        return ""
-    try:
-        reader = PdfReader(str(path))
-        text = []
-        for page in getattr(reader, "pages", []):
-            t = page.extract_text() or ""
-            if t:
-                text.append(t)
-        return "\n".join(text).strip()
-    except Exception:
-        return ""
-
-def _tokenize(s: str) -> List[str]:
-    return re.findall(r"[A-Za-z0-9]+", (s or "").lower())
-
-def _score_text(query: str, text: str) -> float:
-    q_tokens = set(_tokenize(query))
-    if not q_tokens:
-        return 0.0
-    t_tokens = _tokenize(text)
-    if not t_tokens:
-        return 0.0
-    hit = sum(1 for t in q_tokens if t in t_tokens)
-    return round(hit / max(1, len(q_tokens)), 4)
-
-def _chunk_text(text: str, chunk_chars: int = 1600) -> List[str]:
-    # Slightly smaller chunks for speed
-    if not text:
-        return []
-    blocks = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_chars, len(text))
-        blocks.append(text[start:end])
-        start = end
-    return blocks
-
-def _fs_fallback_chunks(query: str, top_k: int) -> List[Dict[str, Any]]:
-    root = pathlib.Path(KB_DIR)
-    if not root.exists():
-        return []
-
-    candidates: List[Dict[str, Any]] = []
-    for path in root.glob("**/*"):
-        if not path.is_file():
-            continue
-        ext = path.suffix.lower()
-        if ext not in {".docx", ".pdf"}:
-            continue
-
-        text = _read_docx(path) if ext == ".docx" else _read_pdf(path)
-        if not text:
-            continue
-
-        chunks = _chunk_text(text)
-        title = path.stem
-        for idx, ch in enumerate(chunks, start=1):
-            score = _score_text(query, ch)
-            candidates.append({
-                "id": f"{path.name}#{idx}",
-                "title": title,
-                "source_path": str(path),
-                "chunk_id": idx,
-                "text": ch,
-                "score": score,
-            })
-
-    candidates.sort(key=lambda c: c.get("score", 0.0), reverse=True)
-    non_zero = [c for c in candidates if c.get("score", 0.0) > 0]
-    return (non_zero or candidates)[:max(1, top_k)]
-
-
-# -------- Output sanitizers (hide KB details from UI) --------
-_PATH_PATTERN = re.compile(r"([A-Za-z]:\\[^ \n]+|\/[^ \n]+)", re.IGNORECASE)
-_BRACKET_CITE_PATTERN = re.compile(r"\[\s*\d+\s*\]")
-_INTERNAL_CONF_PATTERN = re.compile(r"(?i)i'm not fully confident.*?(?:\n|$)")
-
-def _sanitize_text_ui(text: str, brand: str) -> str:
+# ==================== Sanitization ====================
+def _sanitize_response(text: str) -> str:
     if not text:
         return ""
+    patterns = [
+        r"(?i)\b(kb|knowledge base|vector|faiss|embedding)\b",
+        r"(?i)according to .*",
+        r"\[\d+\]",
+        r"[A-Z]:\\[^\s]+",
+        r"/[^\s]+\.(md|pdf|docx|txt)",
+    ]
+    for p in patterns:
+        text = re.sub(p, "", text)
+    text = re.sub(r"(?<!\n)(\d+)[\.\)]\s+", r"\n\1. ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-    # Remove citations like [1], [2]
-    text = _BRACKET_CITE_PATTERN.sub("", text)
+# ==================== Support Contact ====================
+def _format_support_contact() -> str:
+    lines = ["*Need more help? Contact ComEMR Support:*"]
+    support_teams = [
+        {"name": "General Support", "description": "For general platform issues and guidance", "whatsapp": "https://wa.me/1234567890"},
+        {"name": "Technical Support", "description": "Troubleshooting errors, bugs, and technical problems", "whatsapp": "https://wa.me/1234567891"},
+        {"name": "Training & Onboarding", "description": "Help with user training and onboarding workflows", "whatsapp": "https://wa.me/1234567892"},
+    ]
+    for team in support_teams:
+        lines.append(f"*{team['name']}*\n_{team['description']}_\nWhatsApp: {team['whatsapp']}")
+    if getattr(settings, "SUPPORT_EMAIL", None):
+        lines.append(f"📧 Email: {settings.SUPPORT_EMAIL}")
+    if getattr(settings, "SUPPORT_PHONE", None):
+        lines.append(f"📞 Phone: {settings.SUPPORT_PHONE}")
+    if getattr(settings, "SUPPORT_DOCS_URL", None):
+        lines.append(f"📚 Docs: {settings.SUPPORT_DOCS_URL}")
+    return "\n\n".join(lines)
 
-    # Remove any direct file paths or drive hints
-    text = _PATH_PATTERN.sub("", text)
+# ==================== Memory ====================
+class SessionState:
+    def __init__(self, window_size: int):
+        self.window: Deque[Dict[str, str]] = deque(maxlen=window_size)
+        self.summary: str = ""
+        self.turns_since_summary: int = 0
+        self.last_updated_ts: float = time.time()
 
-    # Remove noisy internal confidence boilerplate
-    text = _INTERNAL_CONF_PATTERN.sub("", text)
+class MemoryStore:
+    def __init__(self, window_size: int, ttl_seconds: int):
+        self.window_size = window_size
+        self.ttl_seconds = ttl_seconds
+        self._sessions: Dict[str, SessionState] = {}
 
-    # Collapse excessive whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    def get(self, session_id: str) -> SessionState:
+        now = time.time()
+        state = self._sessions.get(session_id)
+        if not state or (now - state.last_updated_ts) > self.ttl_seconds:
+            state = SessionState(self.window_size)
+            self._sessions[session_id] = state
+        return state
 
-    # Optional: enforce short branded header for consistency
-    # Avoid adding if the message already starts with a greeting/instruction
-    if not re.match(r"^(hi|hello|thank|please|to |go to|step|1\.)", text.strip(), re.IGNORECASE):
-        text = f"{text}"
+    def update_turn(self, session_id: str, role: str, content: str):
+        state = self.get(session_id)
+        state.window.append({"role": role, "content": content})
+        state.turns_since_summary += 1
+        state.last_updated_ts = time.time()
 
-    return text
+    def set_summary(self, session_id: str, summary: str):
+        state = self.get(session_id)
+        state.summary = summary[:MAX_SUMMARY_CHARS]
+        state.turns_since_summary = 0
+        state.last_updated_ts = time.time()
 
+    def clear_session(self, session_id: str):
+        if session_id in self._sessions:
+            del self._sessions[session_id]
 
-# -------- Composer --------
+# ==================== Intent Detection Helper ====================
+def _detect_intent_style(query: str) -> str:
+    q = query.lower().strip()
+    if q.startswith(("how do", "how to", "how can", "steps", "guide me")):
+        return "steps"
+    if any(w in q for w in ["list", "what are", "options", "features", "types"]):
+        return "list"
+    return "explain"
+
+# ==================== Composer ====================
 class RagComposer:
-    """
-    Orchestrates retrieval + generation using OpenAI via adapters.llm.openai_client.
-    Returns (answer_text, meta) where meta = {"confidence": float, "citations": List[Dict], "guarded": bool}
-    """
-
-    def __init__(
-        self,
-        llm_model: Optional[str] = None,
-        confidence_threshold: Optional[float] = None,
-        safeguard: bool = True,
-        top_k: Optional[int] = None,
-        max_context_chars: Optional[int] = None,
-    ):
-        self.llm_model = llm_model or getattr(settings, "OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-        self.top_k = int(top_k or getattr(settings, "TOP_K", int(os.getenv("TOP_K", "3"))))  # faster
-        self.confidence_threshold = float(
-            confidence_threshold if confidence_threshold is not None
-            else getattr(settings, "ANSWER_CONFIDENCE_THRESHOLD", float(os.getenv("ANSWER_CONFIDENCE_THRESHOLD", "0.45")))
-        )
-        self.max_context_chars = int(
-            max_context_chars if max_context_chars is not None
-            else getattr(settings, "MAX_CONTEXT_CHARS", int(os.getenv("MAX_CONTEXT_CHARS", "6000")))
-        )
-        self.safeguard = bool(safeguard if safeguard is not None else getattr(settings, "SAFEGUARD_ENABLE", True))
-
+    def __init__(self, llm_model: Optional[str] = None, top_k: Optional[int] = None, max_context_chars: Optional[int] = None):
+        self.llm_model = llm_model or settings.LLM_MODEL
+        self.top_k = top_k or settings.TOP_K
+        self.max_context_chars = max_context_chars or 6000
+        self.enable_memory = getattr(settings, "ENABLE_CONVERSATION_MEMORY", True)
+        self.memory_window = int(getattr(settings, "MEMORY_WINDOW", 6))
+        self.summary_every_turns = int(getattr(settings, "SUMMARY_EVERY_TURNS", 6))
+        self.session_ttl = int(getattr(settings, "SESSION_TTL_MINUTES", 30)) * 60
+        self._memory = MemoryStore(self.memory_window, self.session_ttl)
         self.retriever = Retriever()
         self.system_prompt = _load_system_prompt()
-        self.brand = os.getenv("COMEMR_BRAND_NAME", getattr(settings, "COMEMR_BRAND_NAME", "ComEMR Support"))
 
-    def answer(self, query: str) -> Tuple[str, Dict[str, Any]]:
-        result = self.compose_answer(query)
-        # 🔒 sanitize UI output to hide KB details
-        clean = _sanitize_text_ui(result.get("answer", ""), self.brand)
-        return clean, {
-            "confidence": result.get("confidence", 0.0),
-            "citations": result.get("citations", []),
-            "guarded": result.get("guarded", False),
-        }
+    # ---------------- Public API ----------------
+    def answer(self, query: str, session_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+        # count only user turns for exit continuity
+        session_user_turns = 0
+        if self.enable_memory and session_id:
+            state = self._memory.get(session_id)
+            session_user_turns = sum(1 for t in state.window if t["role"] == "user")
 
-    def compose_answer(self, query: str) -> Dict[str, Any]:
-        blocked, msg = _default_guardrails(query, self.safeguard)
-        if blocked:
-            return {
-                "answer": msg,
-                "confidence": 0.0,
-                "citations": [],
-                "guarded": True,
-            }
+        special = check_special_message(query, session_user_turns=session_user_turns)
+        if special:
+            if special.get("intent") == "exit" and session_id:
+                self._memory.clear_session(session_id)
+                return special["text"], {"confidence": 1.0, "strategy": "exit"}
+            return special["text"], {"confidence": 1.0, "strategy": "special_message"}
 
-        chunks: List[Dict[str, Any]] = []
-        # ---------- Primary: vector retriever ----------
+        result = self.compose_answer(query, session_id)
+        answer = self._format_for_whatsapp(_sanitize_response(result["answer"]), user_query=query)
+
+        if not answer:
+            answer = "I’m having trouble answering that right now.\n\n" + _format_support_contact()
+
+        if self.enable_memory and session_id:
+            self._memory.update_turn(session_id, "assistant", answer)
+            self._maybe_refresh_summary(session_id)
+
+        return answer, {"confidence": result["confidence"], "strategy": result["strategy"]}
+
+    # ---------------- Core Logic ----------------
+    def compose_answer(self, query: str, session_id: Optional[str]) -> Dict[str, Any]:
+        logger.info("Processing query: %s", query[:100])
+        if self.enable_memory and session_id:
+            self._memory.update_turn(session_id, "user", query)
+        results = self.retriever.retrieve(query, top_k=self.top_k)
+        if not results:
+            return {"answer": "I couldn’t find relevant information.\n\n" + _format_support_contact(),
+                    "confidence": 0.0, "strategy": "no_results"}
+
+        confidence = max(r.get("score", 0.0) for r in results)
+        strategy = confidence_thresholds.get_strategy(confidence)
+
+        context = self._prepare_context(results)
+        summary, recent = self._build_memory_context(session_id) if session_id else ("", "")
+        answer = self._generate_llm_response(query=query, context=context, memory_summary=summary, memory_recent=recent)
+        return {"answer": answer, "confidence": confidence, "strategy": strategy}
+
+    # ---------------- Helpers ----------------
+    def _prepare_context(self, results: List[Dict[str, Any]]) -> str:
+        chunks, total = [], 0
+        for r in results:
+            t = (r.get("text") or "").strip()
+            if not t:
+                continue
+            if total + len(t) > self.max_context_chars:
+                break
+            chunks.append(t)
+            total += len(t)
+        return "\n\n".join(chunks)
+
+    def _build_memory_context(self, session_id: str) -> Tuple[str, str]:
+        state = self._memory.get(session_id)
+        recent_lines, total = [], 0
+        for t in reversed(state.window):
+            line = f"{'You' if t['role']=='user' else 'Assistant'}: {t['content']}"
+            if total + len(line) > MAX_MEMORY_CHARS:
+                break
+            recent_lines.insert(0, line)
+            total += len(line)
+        return state.summary[:MAX_SUMMARY_CHARS], "\n".join(recent_lines)
+
+    def _maybe_refresh_summary(self, session_id: str):
+        state = self._memory.get(session_id)
+        if state.turns_since_summary < self.summary_every_turns:
+            return
+        convo = "\n".join(f"{t['role']}: {t['content']}" for t in state.window if t["content"])
+        if not convo:
+            return
+        summary = chat_complete(f"Summarize the following conversation briefly:\n\n{convo}\n\nSummary:", model="gpt-4.1-mini", temperature=0.2)
+        if summary:
+            self._memory.set_summary(session_id, summary)
+
+    def _generate_llm_response(self, query: str, context: str, memory_summary: str, memory_recent: str) -> str:
+        prompt = f"""{self.system_prompt}
+
+Conversation Summary:
+{memory_summary or "[None]"}
+
+Recent Conversation:
+{memory_recent or "[None]"}
+
+User Question:
+{query}
+
+Relevant Information:
+{context}
+
+Answer format:
+- Short 1–2 line overview
+- Numbered steps for procedures
+- Bullets for options
+- Short paragraphs
+- WhatsApp-friendly
+Answer:"""
+
+        if len(prompt) > MAX_PROMPT_CHARS:
+            prompt = prompt[-MAX_PROMPT_CHARS:]
+
         try:
-            chunks = self.retriever.retrieve(query, top_k=self.top_k)
-        except AttributeError:
-            try:
-                chunks = self.retriever.search(query, top_k=self.top_k)
-            except Exception:
-                chunks = []
-        except Exception:
-            chunks = []
-
-        # ---------- Fallback: file-system KB scan ----------
-        if not chunks:
-            try:
-                chunks = _fs_fallback_chunks(query, top_k=self.top_k)
-            except Exception:
-                chunks = []
-
-        # Filter by confidence threshold
-        filtered = [c for c in (chunks or []) if float(c.get("score", 0.0)) >= self.confidence_threshold]
-
-        if not filtered:
-            fallback = (chunks or [])[:max(1, self.top_k)]
-            context_chunks = _truncate_context(fallback, self.max_context_chars)
-            citations = _format_citations(context_chunks)
-            answer_text = self._compose_with_llm(query, context_chunks, low_confidence=True)
-            max_conf = max([float(c.get("score", 0.0)) for c in fallback], default=0.0)
-            return {
-                "answer": answer_text,
-                "confidence": max_conf,
-                "citations": citations,
-                "guarded": False,
-            }
-
-        context_chunks = _truncate_context(filtered, self.max_context_chars)
-        citations = _format_citations(context_chunks)
-        answer_text = self._compose_with_llm(query, context_chunks, low_confidence=False)
-        agg_conf = max([float(c.get("score", 0.0)) for c in context_chunks], default=0.0)
-        return {
-            "answer": answer_text,
-            "confidence": agg_conf,
-            "citations": citations,
-            "guarded": False,
-        }
-
-    def _compose_with_llm(self, user_query: str, context_chunks: List[Dict[str, Any]], low_confidence: bool) -> str:
-        # Minimal context formatting (no titles/scores) to avoid KB leakage and keep prompts lean
-        blocks = []
-        for i, ch in enumerate(context_chunks, start=1):
-            text = (ch.get("text") or ch.get("chunk_text") or "").strip()
-            if text:
-                blocks.append(f"Context[{i}]:\n{text}\n")
-        context_str = "\n".join(blocks).strip() if blocks else ""
-
-        prompt = (
-            f"{self.system_prompt}\n\n"
-            f"User question:\n{(user_query or '').strip()}\n\n"
-            f"Relevant context passages:\n{context_str if context_str else '[No relevant context found]'}\n\n"
-            "Instructions:\n"
-            "- Answer ONLY using the context; do not invent facts.\n"
-            "- If context is weak/missing, say you don’t know and suggest safe next steps.\n"
-            "- Use clear, numbered steps for procedures.\n"
-            "- Do NOT include citations inline or mention internal sources.\n"
-        )
-        if low_confidence:
-            prompt += (
-                "\nNote: Confidence is low; prioritize caution and avoid firm statements not directly supported by context.\n"
-            )
-
-        try:
-            return chat_complete(prompt).strip()
+            return (chat_complete(prompt, model=self.llm_model) or "").strip()
         except Exception as e:
-            # Return raw context but still sanitized later; avoid exposing file paths or internals
-            safe_context = re.sub(_PATH_PATTERN, "", context_str)
-            return (
-                "Sorry, an internal error occurred while composing the answer. "
-                "Please try again.\n"
-                f"\nContext considered:\n{safe_context}\n"
-                f"\nError: {e}"
-            )
+            logger.error("LLM failure: %s", e)
+            return "I encountered a temporary issue.\n\n" + _format_support_contact()
+
+    # ---------------- WhatsApp Formatting ----------------
+    def _format_for_whatsapp(self, text: str, user_query: Optional[str] = None) -> str:
+        if not text:
+            return ""
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\s*\n\s*", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        def heading_to_bold(line: str) -> str:
+            m = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
+            if not m:
+                return line
+            return f"*{m.group(2).strip()}*"
+
+        lines = [heading_to_bold(l) for l in text.split("\n")]
+        for i, l in enumerate(lines):
+            lines[i] = re.sub(r"^(\d+)[\.\)]\s*", r"\1. ", l)
+            lines[i] = re.sub(r"^(\s*)[\*\-\•]\s*", r"\1• ", l)
+
+        formatted = []
+        for idx, l in enumerate(lines):
+            formatted.append(l)
+            if re.match(r"^\*.+\*$", l):
+                nxt = lines[idx+1] if idx+1 < len(lines) else ""
+                if nxt and not re.match(r"^\s*(•|\d+\.)\s+", nxt):
+                    formatted.append("")
+
+        style = _detect_intent_style(user_query or "")
+        final_lines = []
+
+        if style == "steps":
+            num = 1
+            for l in text.split("\n"):
+                if l.startswith("• "):
+                    final_lines.append(f"{num}. {l[2:].strip()}")
+                    num += 1
+                else:
+                    final_lines.append(l)
+            text = "\n".join(final_lines)
+        elif style == "list":
+            final_lines = []
+            for l in text.split("\n"):
+                if re.match(r"^\d+\.\s+", l):
+                    final_lines.append(f"• {l.split('.', 1)[1].strip()}")
+                else:
+                    final_lines.append(l)
+            text = "\n".join(final_lines)
+
+        if WRAP_WIDTH and WRAP_WIDTH > 0:
+            wrapped = []
+            for l in text.split("\n"):
+                wrapped.extend(textwrap.wrap(l, width=WRAP_WIDTH, replace_whitespace=False) if len(l) > WRAP_WIDTH else [l])
+            text = "\n".join(wrapped)
+
+        if style == "steps" and not text.strip().endswith("?"):
+            text += "\n\nNeed help with the next part?"
+
+        return text.strip()
