@@ -1,476 +1,288 @@
-
 # app.py
 import os
-import json
-from typing import Any, Dict
-from collections import defaultdict, deque
-from datetime import datetime
+import time
+import logging
+import random
+import re
+import textwrap
+import asyncio
+from typing import Dict, List, Tuple, Optional
 
-import requests
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
 
-from rag.composer import RagComposer
-from core.indexing.pipeline import IndexingPipeline
 from config.settings import settings
+from rag.composer import RagComposer, _detect_intent_style
 
-# Optional: your existing WhatsApp adapter
-try:
-    from whatsapp import (
-        send_whatsapp_text as adapter_send_text,
-        send_whatsapp_template as adapter_send_template,
-        # If you’ve already implemented buttons in your adapter, import it here:
-        # send_whatsapp_buttons as adapter_send_buttons
-    )
-    HAS_WHATSAPP_ADAPTER = True
-except Exception:
-    HAS_WHATSAPP_ADAPTER = False
+# -------------------------------------------------------------------
+# App & logging
+# -------------------------------------------------------------------
+app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("whatsapp")
 
-# Optional: your existing routes (kept)
-try:
-    from apps.whatsapp_gateway.routes import router as whatsapp_router
-    HAS_WHATSAPP_ROUTER = True
-except Exception:
-    HAS_WHATSAPP_ROUTER = False
-
-# --- Config / Env ---
-API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-WA_TOKEN     = os.getenv("META_WHATSAPP_TOKEN", "")
-PHONE_ID     = os.getenv("WHATSAPP_PHONE_ID", "")
-BOT_BRAND    = os.getenv("BOT_BRAND", "ComEMR Support")
-OPENAI_KEY   = os.getenv("OPENAI_API_KEY", "")
-
-# NEW: Teams handover config
-TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
-TEAMS_USE_ADAPTIVE_CARDS = os.getenv("TEAMS_USE_ADAPTIVE_CARDS", "false").lower() == "true"
-
-GRAPH_URL = f"https://graph.facebook.com/{API_VERSION}/{PHONE_ID}/messages"
-
-# --- App ---
-app = FastAPI(title="ComEMR Support", version="1.0.0")
-
-# CORS (tighten allowed origins in production)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_headers=["*"],
-    allow_methods=["*"],
+# -------------------------------------------------------------------
+# Environment & config
+# -------------------------------------------------------------------
+API_VERSION = os.getenv("WHATSAPP_API_VERSION") or "v24.0"
+ACCESS_TOKEN = (
+    os.getenv("WHATSAPP_ACCESS_TOKEN")
+    or os.getenv("WHATSAPP_TOKEN")
+    or os.getenv("META_WHATSAPP_TOKEN")
 )
+PHONE_NUMBER_ID = (
+    os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    or os.getenv("WHATSAPP_PHONE_ID")
+    or os.getenv("PHONE_ID")
+)
+VERIFY_TOKEN = (
+    os.getenv("WHATSAPP_VERIFY_TOKEN")
+    or getattr(settings, "WHATSAPP_VERIFY_TOKEN", None)
+)
+WRAP_WIDTH = int(os.getenv("WHATSAPP_WRAP_WIDTH", "72"))
 
-# Shared components
+def _env_ok() -> Tuple[bool, Optional[str]]:
+    if not ACCESS_TOKEN:
+        return False, "Missing ACCESS_TOKEN"
+    if not PHONE_NUMBER_ID:
+        return False, "Missing PHONE_NUMBER_ID"
+    if not VERIFY_TOKEN:
+        return False, "Missing VERIFY_TOKEN"
+    return True, None
+
+ok, why = _env_ok()
+if not ok:
+    logger.warning("WhatsApp env not ready: %s", why)
+
+# -------------------------------------------------------------------
+# RAG composer
+# -------------------------------------------------------------------
 rag = RagComposer(
     llm_model=settings.LLM_MODEL,
-    safeguard=settings.SAFEGUARD_ENABLE,
     top_k=getattr(settings, "TOP_K", 3),
 )
-indexer = IndexingPipeline()
 
-# --- In-memory webhook debug buffer ---
-WEBHOOK_BUFFER = deque(maxlen=50)  # recent payloads for inspection
-
-# --- Conversation memory (rolling, per user) ---
-# Stores a short transcript: [{"ts": "...Z", "role": "user|assistant", "content": "..."}]
-MEMORY = defaultdict(lambda: deque(maxlen=12))
+# -------------------------------------------------------------------
+# Lightweight in-memory tracking (short-term nudges)
+# -------------------------------------------------------------------
+MEMORY: Dict[str, List[Dict[str, str]]] = {}
+MAX_TURNS = 6
+STOP_WORDS = {"ok", "okay", "thanks", "thank you", "bye", "alright", "sure", "not now"}
+COURTESY_NUDGES = ["Want the next step?", "Need help with the next part?", "Should I continue?"]
 
 def remember(user: str, role: str, content: str):
-    MEMORY[user].append({
-        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "role": role,
-        "content": (content or "").strip()[:2000],
-    })
+    MEMORY.setdefault(user, []).append({"role": role, "content": content, "ts": time.time()})
+    MEMORY[user] = MEMORY[user][-MAX_TURNS:]
 
-def last_user_message(user: str) -> str:
-    for turn in reversed(MEMORY[user]):
-        if turn["role"] == "user":
-            return turn["content"]
-    return ""
+def clear_memory(user: str):
+    MEMORY.pop(user, None)
+    if hasattr(rag, "_memory"):
+        rag._memory.clear_session(user)
 
-def _gather_recent_turns(user: str, max_turns: int = 12) -> list:
-    return list(MEMORY[user])[-max_turns:]
+# -------------------------------------------------------------------
+# Response hygiene helpers
+# -------------------------------------------------------------------
+def sanitize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"\*{1,3}", "", text)        # strip markdown asterisks
+    text = re.sub(r"\n{3,}", "\n\n", text)     # collapse blank lines
+    lines = text.strip().splitlines()
+    text = "\n".join(lines[:12])               # keep it reasonable for WA
+    text = text[:4096]                          # WA hard cap
+    return text.strip()
 
-# --- Startup diagnostics (safe) ---
-@app.on_event("startup")
-def startup_diag():
-    print("[Startup] WhatsApp config:")
-    print("  API version:", API_VERSION)
-    print("  TOKEN prefix:", (WA_TOKEN[:8] + "...") if WA_TOKEN else "MISSING")
-    print("  PHONE_ID:", PHONE_ID if PHONE_ID else "MISSING")
-    if not WA_TOKEN or not PHONE_ID:
-        print("⚠️ META_WHATSAPP_TOKEN or WHATSAPP_PHONE_ID missing. Sending will fail.")
-    if TEAMS_WEBHOOK_URL:
-        print("[Startup] Teams webhook configured ✓")
-    else:
-        print("[Startup] TEAMS_WEBHOOK_URL not set (handover will be skipped).")
+def maybe_add_nudge(text: str) -> str:
+    if random.random() < 0.25:
+        return f"{text}\n\n{random.choice(COURTESY_NUDGES)}"
+    return text
 
-# --- Low-level WhatsApp send helpers (used if adapter is absent) ---
-def _wa_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {WA_TOKEN}",
-        "Content-Type": "application/json",
-    }
+# -------------------------------------------------------------------
+# WhatsApp formatting merged from composer
+# -------------------------------------------------------------------
+def format_for_whatsapp(text: str, user_query: Optional[str] = None) -> str:
+    if not text:
+        return ""
 
-def _wa_post(payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.post(GRAPH_URL, headers=_wa_headers(), data=json.dumps(payload), timeout=30)
-    try:
-        data = r.json()
-    except Exception:
-        data = {"text": r.text}
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail={"status": r.status_code, "response": data})
-    return data
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\s*\n\s*", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
-def send_text(to: str, body: str) -> Dict[str, Any]:
-    if HAS_WHATSAPP_ADAPTER:
-        # Use your adapter if present
-        return adapter_send_text(to, body)
-    # Fallback direct Cloud API call
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"preview_url": False, "body": body},
-    }
-    return _wa_post(payload)
+    def heading_to_bold(line: str) -> str:
+        m = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
+        return f"*{m.group(2).strip()}*" if m else line
 
-def send_buttons(to: str, body_text: str) -> Dict[str, Any]:
-    # If you have adapter_send_buttons, prefer it. Otherwise, use raw API:
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": body_text},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": "TALK_SUPPORT",   "title": "TALK TO SUPPORT"}},
-                    {"type": "reply", "reply": {"id": "RESET_PASSWORD", "title": "Reset password"}},
-                    {"type": "reply", "reply": {"id": "SYSTEM_STATUS",  "title": "System status"}},
-                ]
-            },
-        },
-    }
-    return _wa_post(payload)
+    lines = [heading_to_bold(l) for l in text.split("\n")]
+    for i, l in enumerate(lines):
+        lines[i] = re.sub(r"^(\d+)[\.\)]\s*", r"\1. ", l)
+        lines[i] = re.sub(r"^(\s*)[\*\-\•]\s*", r"\1• ", l)
 
-# --- AI answer: try RAG -> OpenAI -> fallback text ---
+    formatted = []
+    for idx, l in enumerate(lines):
+        formatted.append(l)
+        if re.match(r"^\*.+\*$", l):
+            nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+            if nxt and not re.match(r"^\s*(•|\d+\.)\s+", nxt):
+                formatted.append("")
+
+    style = _detect_intent_style(user_query or "")
+    final_lines = []
+
+    if style == "steps":
+        num = 1
+        for l in text.split("\n"):
+            if l.startswith("• "):
+                final_lines.append(f"{num}. {l[2:].strip()}")
+                num += 1
+            else:
+                final_lines.append(l)
+        text = "\n".join(final_lines)
+    elif style == "list":
+        final_lines = []
+        for l in text.split("\n"):
+            if re.match(r"^\d+\.\s+", l):
+                final_lines.append(f"• {l.split('.', 1)[1].strip()}")
+            else:
+                final_lines.append(l)
+        text = "\n".join(final_lines)
+
+    # Wrap long lines
+    if WRAP_WIDTH > 0:
+        wrapped = []
+        for l in text.split("\n"):
+            wrapped.extend(textwrap.wrap(l, width=WRAP_WIDTH, replace_whitespace=False) if len(l) > WRAP_WIDTH else [l])
+        text = "\n".join(wrapped)
+
+    if style == "steps" and not text.strip().endswith("?"):
+        text += "\n\nNeed help with the next part?"
+
+    return text.strip()
+
+# -------------------------------------------------------------------
+# AI answering logic with automatic summary context
+# -------------------------------------------------------------------
 def ai_answer(prompt: str, user: str) -> str:
-    # Build short rolling context (system + last 6 turns + new user prompt) for OpenAI path
-    context_turns = _gather_recent_turns(user, max_turns=6)
-    convo = []
-    for t in context_turns:
-        role = "user" if t["role"] == "user" else "assistant"
-        convo.append({"role": role, "content": t["content"]})
+    normalized = prompt.lower().strip()
+    if any(word in normalized for word in STOP_WORDS):
+        clear_memory(user)
+        return "Alright 👍"
 
-    # 1) Try your RAG first
     try:
-        if hasattr(rag, "answer") and callable(getattr(rag, "answer")):
-            ans = rag.answer(prompt)
-        else:
-            ans = rag(prompt)  # type: ignore
-        if isinstance(ans, str) and ans.strip():
-            remember(user, "assistant", ans)
-            return ans.strip()
-        if isinstance(ans, dict) and ans.get("answer"):
-            out = str(ans["answer"]).strip()
-            remember(user, "assistant", out)
-            return out
-    except Exception as e:
-        print("[AI:RAG] Error:", e)
+        # Compose answer using RAG + conversation memory
+        answer, meta = rag.answer(prompt, session_id=user)
+        if not answer:
+            return "Could you clarify that?"
 
-    # 2) Fallback to OpenAI if available
-    if OPENAI_KEY:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_KEY)
-            system_prompt = (
-                "You are ComEMR Support Assistant. Be concise, helpful, and factual. "
-                "If unsure, ask for details. Provide step-by-step guidance for ComEMR users."
-            )
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": system_prompt}, *convo, {"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-            out = resp.choices[0].message.content.strip()
-            remember(user, "assistant", out)
-            return out
-        except Exception as e:
-            print("[AI:OpenAI] Error:", e)
+        # Format, sanitize, and include memory-aware context
+        answer = sanitize_text(answer)
+        answer = format_for_whatsapp(answer, user_query=prompt)
+        if meta.get("strategy") == "exit":
+            clear_memory(user)
+            return answer
 
-    # 3) Final fallback text
-    fallback = "I’m having trouble reaching the AI right now. Please try again, or tap TALK TO SUPPORT."
-    remember(user, "assistant", fallback)
-    return fallback
+        answer = maybe_add_nudge(answer)
+        remember(user, "assistant", answer)
+        return answer
 
-# --- Conversation summarizer (AI) ---
-def summarize_conversation(user: str) -> str:
-    """
-    Creates a short, human‑friendly summary from MEMORY.
-    Output: 4–7 bullet points with problem, attempts, errors, and current ask.
-    """
-    turns = _gather_recent_turns(user, max_turns=12)
-    if not turns:
-        return "No conversation content available."
+    except Exception:
+        logger.exception("RAG answering failed")
+        return "I’m having trouble right now. Please try again later."
 
-    convo_lines = []
-    for t in turns:
-        role = "User" if t["role"] == "user" else "Bot"
-        convo_lines.append(f"{role}: {t['content']}")
+# -------------------------------------------------------------------
+# WhatsApp send helper
+# -------------------------------------------------------------------
+async def send_whatsapp_text(to: str, text: str) -> None:
+    if not text:
+        text = "…"  # avoid empty body 400
 
-    prompt = (
-        "Summarize the following WhatsApp support conversation in 4–7 concise bullet points. "
-        "Include: the user's problem, steps already tried, any error messages, device/app context if present, "
-        "and the user's latest request. Use plain language:\n\n"
-        + "\n".join(convo_lines)
-    )
-    summary = ai_answer(prompt, user)
+    base = f"https://graph.facebook.com/{API_VERSION}"
+    url = f"{base}/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
 
-    # Simple deterministic fallback if AI returns the standard failure message
-    if summary.lower().startswith("i’m having trouble reaching the ai"):
-        # Build a lightweight summary from last few user turns
-        bullets = []
-        for t in turns:
-            if t["role"] == "user":
-                bullets.append(f"- {t['content']}")
-        summary = "Summary (fallback):\n" + "\n".join(bullets[-6:]) if bullets else "Summary unavailable."
-    return summary
+    async with httpx.AsyncClient(timeout=15) as client:
+        for attempt in range(1, 4):
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code >= 400:
+                    logger.error(
+                        "WA send failed (try %s): %s %s | body=%s",
+                        attempt, resp.status_code, resp.reason_phrase, resp.text
+                    )
+                    resp.raise_for_status()
+                logger.info("WA send OK: %s", resp.text)
+                return
+            except httpx.HTTPStatusError:
+                raise
+            except Exception as e:
+                logger.warning("WA send exception (try %s): %s", attempt, e)
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(2 ** attempt)
 
-# --- Teams payload helpers ---
-def _post_to_teams(payload: dict):
-    if not TEAMS_WEBHOOK_URL:
-        print("⚠️ TEAMS_WEBHOOK_URL missing")
-        return
-    try:
-        r = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=15)
-        r.raise_for_status()
-        print("[Handover] Summary posted to Teams")
-    except Exception as e:
-        print("[Handover] Teams post failed:", e)
+# -------------------------------------------------------------------
+# Health & config endpoints
+# -------------------------------------------------------------------
+@app.get("/healthz")
+async def healthz():
+    ok, why = _env_ok()
+    return JSONResponse({
+        "ok": ok,
+        "why": why,
+        "api_version": API_VERSION,
+        "phone_number_id": PHONE_NUMBER_ID,
+        "has_token": bool(ACCESS_TOKEN),
+    }, status_code=200 if ok else 500)
 
-def _teams_text_payload(user_e164: str, profile_name: str, summary: str, last_msg: str) -> dict:
-    who = f"+{user_e164}" if not (user_e164 or "").startswith("+") else user_e164
-    display = f"{profile_name} ({who})" if profile_name else who
-    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-    text = (
-        f"**WhatsApp → Human Escalation**\n\n"
-        f"**User:** {display}\n"
-        f"**Last message:** {last_msg or '_none_'}\n\n"
-        f"**Summary:**\n{summary}\n\n"
-        f"**Time:** {ts}"
-    )
-    return {"text": text}
-
-def _teams_adaptive_card_payload(user_e164: str, profile_name: str, summary: str, last_msg: str) -> dict:
-    who = f"+{user_e164}" if not (user_e164 or "").startswith("+") else user_e164
-    display = f"{profile_name} ({who})" if profile_name else who
-    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-    card = {
-      "type": "message",
-      "attachments": [{
-        "contentType": "application/vnd.microsoft.card.adaptive",
-        "content": {
-          "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-          "type": "AdaptiveCard",
-          "version": "1.5",
-          "body": [
-            {"type":"TextBlock","text":"WhatsApp → Human Escalation","weight":"Bolder","size":"Large"},
-            {"type":"FactSet","facts":[
-              {"title":"User","value": display},
-              {"title":"Last message","value": (last_msg or "_none_")},
-              {"title":"Time","value": ts}
-            ]},
-            {"type":"TextBlock","text":"Summary","weight":"Bolder","spacing":"Medium"},
-            {"type":"TextBlock","text": summary[:4500], "wrap": True}
-          ]
-        }
-      }]
-    }
-    return card
-
-def send_summary_to_teams(user_e164: str, profile_name: str = ""):
-    """
-    Builds a summary using AI and sends to Teams (text or Adaptive Card).
-    """
-    summary = summarize_conversation(user_e164)
-    last_msg = last_user_message(user_e164)
-
-    payload = (
-        _teams_adaptive_card_payload(user_e164, profile_name, summary, last_msg)
-        if TEAMS_USE_ADAPTIVE_CARDS else
-        _teams_text_payload(user_e164, profile_name, summary, last_msg)
-    )
-    _post_to_teams(payload)
-
-# --- Health check ---
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-# --- Optional: trigger KB reindex (protect in prod) ---
-@app.post("/kb/reindex")
-def reindex():
-    count = indexer.reindex_all()
-    return {"reindexed": count}
-
-# --- Webhook verification (GET) ---
-@app.get("/webhook")
-def verify(
-    hub_mode: str = Query(default=None, alias="hub.mode"),
-    hub_verify_token: str = Query(default=None, alias="hub.verify_token"),
-    hub_challenge: str = Query(default=None, alias="hub.challenge"),
-):
+# -------------------------------------------------------------------
+# Webhook verification (GET)
+# -------------------------------------------------------------------
+@app.get("/whatsapp/webhook")
+async def verify(hub_mode: str | None = None, hub_verify_token: str | None = None, hub_challenge: str | None = None):
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        # Meta requires the challenge to be returned verbatim with 200
-        return hub_challenge
-    raise HTTPException(status_code=403, detail="Forbidden")
+        return PlainTextResponse(hub_challenge or "")
+    return PlainTextResponse("Forbidden", status_code=403)
 
-# --- Webhook receive (POST) ---
-@app.post("/webhook")
-async def incoming(request: Request):
-    data = await request.json()
-    WEBHOOK_BUFFER.appendleft(data)  # capture for debugging
-
-    entries = data.get("entry") or []
-    if not entries:
-        return {"status": "ignored_no_entry"}
-
-    value = (entries[0].get("changes") or [{}])[0].get("value", {})
-
-    # Extract contact display name when provided
-    contacts = value.get("contacts") or []
-    profile_name = ""
-    if contacts and isinstance(contacts, list):
-        profile_name = ((contacts[0].get("profile") or {}).get("name") or "").strip()
-
-    # 1) Delivery/read statuses (debug-friendly)
-    if "statuses" in value:
-        for s in value.get("statuses", []):
-            print(
-                "[WA:Status]",
-                "id=", s.get("id"),
-                "status=", s.get("status"),
-                "timestamp=", s.get("timestamp"),
-                "recipient_id=", s.get("recipient_id"),
-                "errors=", s.get("errors"),
-            )
-        return {"status": "ok_status"}
-
-    # 2) Incoming messages we care about
-    messages = value.get("messages", [])
-    if not messages:
-        return {"status": "ok_no_message"}
-
-    msg = messages[0]
-    from_e164 = msg.get("from")  # E.164 without +
-    msg_type = msg.get("type")
-
-    # a) Text → remember + Welcome + buttons
-    if msg_type == "text":
-        user_text = (msg.get("text") or {}).get("body", "").strip()
-        if user_text:
-            remember(from_e164, "user", user_text)
-
-        welcome = f"Karibu! 👋 This is {BOT_BRAND}.\nPick an option below or ask your question:"
-        try:
-            send_buttons(from_e164, welcome)
-        except Exception as e:
-            # If buttons fail for any reason, send plain text fallback
-            print("[Buttons] Error:", e)
-            send_text(from_e164, welcome + "\n\n• TALK TO SUPPORT\n• Reset password\n• System status")
-        return {"status": "ok_welcome"}
-
-    # b) Interactive button replies
-    if msg_type == "interactive":
-        interactive = msg.get("interactive") or {}
-        subtype = interactive.get("type")
-        if subtype == "button_reply":
-            reply = interactive.get("button_reply") or {}
-            btn_id = reply.get("id")
-
-            # Remember the user's selection as part of the transcript
-            if btn_id:
-                remember(from_e164, "user", f"[Button] {btn_id}")
-
-            if btn_id == "TALK_SUPPORT":
-                send_text(from_e164, "Okay, summarizing your issue and connecting you to a human agent…")
-                # NEW: Summarize and send to Teams
-                send_summary_to_teams(from_e164, profile_name)
-                return {"status": "ok_escalated"}
-
-            elif btn_id == "RESET_PASSWORD":
-                send_text(
-                    from_e164,
-                    "To reset your ComEMR password:\n"
-                    "1) Open ComEMR app → Login screen → 'Forgot password'\n"
-                    "2) Enter phone number used for your ComEMR account\n"
-                    "3) Check WhatsApp/SMS for OTP and follow prompts\n\n"
-                    "Need a human? Tap TALK TO SUPPORT."
-                )
-                return {"status": "ok_reset_pw"}
-
-            elif btn_id == "SYSTEM_STATUS":
-                # Placeholder; wire to real status endpoint when ready
-                send_text(from_e164, "All systems operational ✅\nNo active incidents reported.")
-                return {"status": "ok_status"}
-
-        elif subtype == "list_reply":
-            list_reply = interactive.get("list_reply") or {}
-            choice_title = list_reply.get("title") or ""
-            remember(from_e164, "user", f"[List] {choice_title}")
-            send_text(from_e164, f"You chose: {choice_title}")
-            return {"status": "ok_list_reply"}
-
-        # Any other interactive subtype
-        send_text(from_e164, "Got your selection.")
-        return {"status": "ok_interactive_other"}
-
-    # c) Other content → remember + AI + re-show menu
-    remember(from_e164, "user", f"[{msg_type}] content")
-    fallback_prompt = "User sent a non-text message on WhatsApp. Provide helpful next steps for a ComEMR user."
-    ai = ai_answer(fallback_prompt, user=from_e164)
-    send_text(from_e164, ai)
+# -------------------------------------------------------------------
+# Webhook receiver (POST)
+# -------------------------------------------------------------------
+@app.post("/whatsapp/webhook")
+async def webhook(request: Request):
+    payload = await request.json()
     try:
-        send_buttons(from_e164, "Pick an option or reply with your question:")
-    except Exception as e:
-        print("[Buttons:fallback] Error:", e)
-    return {"status": "ok_fallback"}
+        entry = payload.get("entry", [{}])[0]
+        change = entry.get("changes", [{}])[0]
+        value = change.get("value", {})
 
-# --- Debug helpers: inspect recent webhook payloads in dev ---
-@app.get("/webhook/debug/last")
-def webhook_debug_last(n: int = 1):
-    n = max(1, min(n, len(WEBHOOK_BUFFER)))
-    return {"count": n, "items": list(WEBHOOK_BUFFER)[:n]}
+        if value.get("statuses"):
+            logger.info("Status update: %s", value["statuses"])
+            return {"status": "ok"}
 
-# --- Existing router (kept, if present) ---
-if HAS_WHATSAPP_ROUTER:
-    app.include_router(whatsapp_router, prefix="/whatsapp", tags=["WhatsApp Gateway"])
+        messages = value.get("messages")
+        if not messages:
+            return {"status": "ignored"}
 
-# --- Test send endpoints (kept) ---
-@app.post("/whatsapp/send-test/text", tags=["WhatsApp Gateway"])
-def send_test_text(
-    to: str = Query(..., description="Recipient E.164, e.g. 254705091683"),
-    body: str = Query("Auth OK – replying from backend (v22.0)")
-):
-    try:
-        result = send_text(to, body)
-        return {"ok": True, "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        for message in messages:
+            user = message["from"]
+            text = message.get("text", {}).get("body", "").strip()
+            if not text:
+                logger.info("Non-text message from %s ignored", user)
+                continue
 
-@app.post("/whatsapp/send-test/template", tags=["WhatsApp Gateway"])
-def send_test_template(
-    to: str = Query(..., description="Recipient E.164, e.g., 254705091683"),
-    name: str = Query("hello_world", description="Template name"),
-    lang: str = Query("en_US", description="Language code, e.g., en_US")
-):
-    if not HAS_WHATSAPP_ADAPTER:
-        # You can still send templates without the adapter, but we kept parity with your setup.
-        raise HTTPException(status_code=500, detail="WhatsApp adapter not available/importable.")
-    try:
-        result = adapter_send_template(to, name, lang)
-        return {"ok": True, "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+            logger.info("Incoming message from %s: %s", user, text)
+            remember(user, "user", text)
+
+            # Memory-aware answer
+            reply = ai_answer(text, user)
+            await send_whatsapp_text(user, reply)
+            logger.info("Reply sent to %s", user)
+
+        return {"status": "ok"}
+
+    except httpx.HTTPStatusError as e:
+        logger.exception("Webhook send failed with HTTP error")
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=400)
+    except Exception:
+        logger.exception("Webhook processing failed")
+        return JSONResponse({"status": "error"}, status_code=500)
