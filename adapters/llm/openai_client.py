@@ -5,17 +5,18 @@ import time
 import random
 from typing import Optional
 
-from openai import OpenAI
-from openai import APIError, RateLimitError, InternalServerError  # type: ignore
-
 from config.settings import settings
 
-_client: Optional[OpenAI] = None
+_client: Optional["OpenAI"] = None
 
 
-def get_openai() -> OpenAI:
+def get_openai() -> "OpenAI":
     global _client
     if _client is None:
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            raise RuntimeError("openai package is not installed") from e
         # If your org or timeout is needed, you can extend here:
         # _client = OpenAI(api_key=settings.OPENAI_API_KEY, organization=getattr(settings, "OPENAI_ORG", None), timeout=60)
         _client = OpenAI(api_key=settings.OPENAI_API_KEY)
@@ -28,7 +29,8 @@ def _with_backoff(fn, *args, max_retries: int = 4, **kwargs):
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
-        except (RateLimitError, InternalServerError, APIError) as e:
+        except Exception as e:
+            # We catch broad exceptions here to be tolerant of the OpenAI package not being present or reporting different errors.
             if attempt == max_retries - 1:
                 raise
             sleep_for = delay + random.random() * 0.5
