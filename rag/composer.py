@@ -5,7 +5,9 @@ import re
 
 from config.settings import settings
 from .retriever import Retriever
-from adapters.llm.openai_client import chat_complete  # ✅ Your wrapper
+# Prefer importing the client module lazily at call time to allow tests to monkeypatch it
+import adapters.llm.openai_client as openai_client  # uses chat_complete via openai_client.chat_complete
+import logging
 
 # Optional fallback readers
 try:
@@ -246,18 +248,18 @@ class RagComposer:
         # 2️⃣ Guardrails
         blocked, msg = _default_guardrails(query, self.safeguard)
         if blocked:
-            return msg, {"confidence": 0.0, "citations": [], "guarded": True, "intent": None}
+            return msg, {"confidence": 0.0, "citations": [], "guarded": True, "intent": None, "low_confidence": False}
 
         # 3️⃣ Micro-template check
         micro_steps = _match_micro_template(query)
         if micro_steps:
             answer_text = "\n".join(micro_steps)
-            return answer_text, {"confidence": 1.0, "citations": [], "guarded": False, "intent": _detect_intent(query)}
+            return answer_text, {"confidence": 1.0, "citations": [], "guarded": False, "intent": _detect_intent(query), "low_confidence": False}
 
         # 4️⃣ Intent detection
         intent = _detect_intent(query)
         if intent == "greeting":
-            return f"Hello! I’m {self.brand}. How can I assist you today?", {"confidence": 1.0, "citations": [], "guarded": False, "intent": intent}
+            return f"Hello! I’m {self.brand}. How can I assist you today?", {"confidence": 1.0, "citations": [], "guarded": False, "intent": intent, "low_confidence": False}
 
         # Meta intent: short direct answers (do not use numbered lists)
         if intent == "meta":
@@ -265,7 +267,7 @@ class RagComposer:
                 f"I’m a virtual assistant for {self.brand}. I can help with ComEMR support — troubleshooting, how-tos, and guidance. "
                 "You can ask me about the app, connectivity, or common procedures."
             )
-            return meta_ans, {"confidence": 1.0, "citations": [], "guarded": False, "intent": intent}
+            return meta_ans, {"confidence": 1.0, "citations": [], "guarded": False, "intent": intent, "low_confidence": False}
 
         # 5️⃣ KB retrieval
         try:
@@ -292,7 +294,7 @@ class RagComposer:
 
         clean_answer = _sanitize_text_ui(answer_text, self.brand)
         max_conf = max([float(c.get("score", 0.0)) for c in context_chunks], default=0.0)
-        return clean_answer, {"confidence": max_conf, "citations": citations, "guarded": False, "intent": intent}
+        return clean_answer, {"confidence": max_conf, "citations": citations, "guarded": False, "intent": intent, "low_confidence": low_confidence}
 
     def _compose_with_llm(
         self,
@@ -326,35 +328,40 @@ class RagComposer:
         lang_instruction = ""
         if language == 'krio':
             lang_instruction = (
-                "\nNote: The user requested Krio. Reply primarily in English but include short, natural Krio phrases where appropriate. "
-                "Keep important facts in English to maintain clarity for clinicians; Krio should not exceed ~20% of the reply and should be used only when the user initiated it."
+                "\nNote: The user requested Krio. Reply mostly in English but include Krio so that roughly 40% of the reply is in Krio (by sentence count) and 60% in English. "
+                "Keep critical guidance primarily in English to ensure clarity for clinicians; use Krio for friendly phrasing or short clarifying sentences."
             )
 
         prompt = f"""
-{self.system_prompt}
+    User question:
+    {query}
 
-User question:
-{query}
+    {memory_section}Relevant context:
+    {context_text or '[No relevant context found]'}
 
-{memory_section}Relevant context:
-{context_text or '[No relevant context found]'}
-
-Instructions:
-- Answer clearly and concisely.
-- For short direct answers (yes/no or single-line replies), do NOT use numbered lists; use a single plain sentence.
-- Provide plain numbered steps (e.g., '1. Step one') only for procedural answers with multiple steps; avoid markdown bullets or emphasis.
-- Be tolerant of minor typos and infer user intent; ask a clarifying question only if intent is unclear.
-- Use friendly language where appropriate.
-- Avoid internal paths, confidential info, or private data.
-- If unsure, suggest safe next steps.
-{lang_instruction}
-"""
+    Instructions:
+    - Answer clearly and concisely.
+    - Use natural, conversational language.
+    - For short direct answers (yes/no or single-line replies), do NOT use numbered lists; use a single plain sentence.
+    - Provide plain numbered steps (e.g., '1. Step one') only for procedural answers with multiple steps; avoid markdown bullets or emphasis.
+    - Be tolerant of minor typos and infer user intent; ask a clarifying question only if intent is unclear.
+    - Use friendly language where appropriate.
+    - Avoid internal paths, confidential info, or private data.
+    - If unsure, suggest safe next steps.
+    {lang_instruction}
+    """
         if low_confidence:
             prompt += "\nNote: KB confidence is low; do NOT hallucinate. If you cannot answer confidently, respond that you don't know and ask ONE concise clarifying question (1 sentence). You may provide brief general guidance labeled 'General guidance' if helpful.\n"
 
         try:
-            # chat_complete signature: chat_complete(prompt, *, model=None, temperature=None, max_tokens=None)
-            answer = chat_complete(prompt, model=self.llm_model, temperature=settings.LLM_TEMPERATURE, max_tokens=settings.LLM_MAX_TOKENS)
+            # call the client module at runtime so tests can monkeypatch openai_client.chat_complete
+            answer = openai_client.chat_complete(
+                prompt,
+                model=self.llm_model,
+                temperature=settings.LLM_TEMPERATURE,
+                max_tokens=settings.LLM_MAX_TOKENS,
+                system_prompt=self.system_prompt,
+            )
             return answer.strip()
         except Exception:
             # Log full exception server-side but return a generic safe message to the user

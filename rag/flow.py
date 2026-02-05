@@ -165,28 +165,57 @@ class BotFlow:
         if not text:
             return False
         t = text.lower()
-        # explicit markers
+        # explicit markers only - do NOT auto-enable Krio based on tokens alone.
         if 'krio' in t or 'speak krio' in t or 'in krio' in t or t.strip().startswith('krio:'):
             return True
-        # conservative fallback: look for explicit 'wetin' which is a common Krio token
-        if re.search(r"\bwetin\b", t):
-            return True
 
-        # Optional integration with langdetect (best-effort, optional dependency)
-        try:
-            from langdetect import detect_langs
-            # ask langdetect for probable languages; if it returns low-confidence top language, and message contains Krio tokens, assume Krio
-            probs = detect_langs(text)
-            if probs:
-                top = probs[0]
-                # top.lang may be 'en' typically; err on side of caution: if top.prob < 0.8 and ('wetin' in t or 'den' in t):
-                if getattr(top, 'prob', 1.0) < 0.8 and (re.search(r"\bwetin\b", t) or re.search(r"\bden\b", t)):
-                    return True
-        except Exception:
-            # langdetect not available or failed; ignore
-            pass
-
+        # Do not infer Krio from single tokens like 'wetin' to avoid accidental language switching.
+        # If advanced auto-detection is desired in the future, make it opt-in via a setting.
         return False
+
+    def _is_short_ack(self, text: str) -> bool:
+        """Return True for short acknowledgements or simple closings that should not trigger follow-ups.
+
+        Examples: 'thanks', 'thank you', 'than you' (typo), 'bye', 'ok', 'okay', 'k', 'yes', 'no'
+        """
+        if not text:
+            return False
+        t = text.strip().lower()
+        if len(t) > 60:
+            return False
+        if re.search(r"\b(thank(s| you)?|than you|ty|bye|goodbye|see you|thanks a lot|ok(ay)?|k)\b", t):
+            return True
+        if t in ("ok", "okay", "yes", "no", "sure"):
+            return True
+        return False
+
+    def _is_closing_message(self, text: str) -> bool:
+        """Return True for explicit conversation-ending messages (short 'thank you' / 'bye' forms).
+
+        This is intentionally conservative to avoid misclassifying longer follow-up requests as closers.
+        """
+        if not text:
+            return False
+        t = text.strip().lower()
+        if len(t) > 120:
+            return False
+        if re.search(r"\b(thank(s| you)?|than you|thanks a lot|bye|goodbye|see you|talk later)\b", t):
+            return True
+        return False
+
+    def _is_resolution_message(self, text: str) -> bool:
+        """Return True if the user indicates the issue is resolved or working now."""
+        if not text:
+            return False
+        t = text.strip().lower()
+        if len(t) > 200:
+            return False
+        return bool(
+            re.search(
+                r"\b(resolved|fixed|worked|now works|working now|it works|it worked|problem solved|solved|all good|okay now|ok now)\b",
+                t,
+            )
+        )
 
     def handle_message(self, user_id: str, message: str, session_id: str | None = None):
         """Main entrypoint called by the webhook to handle and respond to a message.
@@ -198,18 +227,120 @@ class BotFlow:
         use_krio = self._detect_krio(message)
         language = 'krio' if use_krio else 'en'
 
-        # Save incoming user message to conversation memory (best-effort)
+        # Avoid sending repeated follow-ups: if the conversation was explicitly closed earlier, short acknowledgements should be ignored
         try:
             from config.settings import settings
             if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
                 try:
                     from core.memory.memory_service import ConversationMemory
                     mem = ConversationMemory()
-                    mem.save_message(session_id, "user", cleaned)
+                    recent = mem.get_recent(session_id, limit=10)
+                    closed = any(m.get('role') == 'system' and m.get('text') == 'conversation_closed' for m in recent)
+                    if closed and self._is_short_ack(message):
+                        # persist the user's ack but do not send another message
+                        mem.save_message(session_id, "user", message)
+                        return "", {"ignored": True}
                 except Exception:
                     pass
         except Exception:
             pass
+
+        # Detect resolution messages (issue fixed/working) and send a friendly closing reply
+        if self._is_resolution_message(cleaned):
+            try:
+                from config.settings import settings
+                outgoing = "Great — glad it’s working now. If you need anything else, just message me anytime."
+                if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
+                    try:
+                        from core.memory.memory_service import ConversationMemory
+                        mem = ConversationMemory()
+                        mem.save_message(session_id, "user", cleaned)
+                        mem.save_message(session_id, "assistant", outgoing)
+                        mem.save_message(session_id, "system", "conversation_closed")
+                    except Exception:
+                        pass
+            except Exception:
+                outgoing = "Great — glad it’s working now."
+
+            try:
+                self.whatsapp.send_message(user_id, message=outgoing)
+            except Exception:
+                pass
+
+            return outgoing, {"conversation_closed": True, "resolution_ack": True}
+
+        # Detect explicit closing messages (thank you / bye) and send a single friendly closing reply
+        if self._is_closing_message(cleaned):
+            try:
+                from config.settings import settings
+                outgoing = "You're welcome — glad I could help. If you need anything else, just message me anytime."
+                if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
+                    try:
+                        from core.memory.memory_service import ConversationMemory
+                        mem = ConversationMemory()
+                        mem.save_message(session_id, "user", cleaned)
+                        mem.save_message(session_id, "assistant", outgoing)
+                        mem.save_message(session_id, "system", "conversation_closed")
+                    except Exception:
+                        pass
+            except Exception:
+                outgoing = "You're welcome — glad I could help."
+
+            try:
+                self.whatsapp.send_message(user_id, message=outgoing)
+            except Exception:
+                pass
+
+            return outgoing, {"conversation_closed": True}
+
+        # Feature: Show a short structured menu only on the first interaction to help CHWs
+        try:
+            from config.settings import settings
+            if getattr(settings, "ENABLE_FIRST_TOUCH_MENU", True) and getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
+                try:
+                    from core.memory.memory_service import ConversationMemory
+                    mem = ConversationMemory()
+                    recent = mem.get_recent(session_id, limit=10)
+
+                    # If no prior messages, show menu and save a system marker so subsequent replies can be handled
+                    if not recent:
+                        try:
+                            from core.menu import menu_routing
+                            menu_list = menu_routing.show_menu_options(None)
+                            menu_text = "\n".join(menu_list)
+                            # Send and persist menu marker
+                            self.whatsapp.send_message(user_id, message=menu_text)
+                            mem.save_message(session_id, "assistant", menu_text)
+                            mem.save_message(session_id, "system", "menu_shown")
+                            return menu_text, {"menu_shown": True}
+                        except Exception:
+                            # Fall through to normal processing if menu send fails
+                            pass
+
+                    # If a menu has been shown and the current message looks like a menu selection, handle it here
+                    menu_shown = any(m.get('role') == 'system' and m.get('text') == 'menu_shown' for m in recent)
+                    if menu_shown:
+                        try:
+                            from core.menu.menu_routing import process_menu_selection
+                            sel = cleaned.strip().lower()
+                            reply, meta = process_menu_selection(sel)
+                            # If process_menu_selection didn't understand, let the message go to composer
+                            if meta.get('menu_selected') is not None:
+                                # save user and assistant messages and mark menu as consumed
+                                mem.save_message(session_id, "user", cleaned)
+                                self.whatsapp.send_message(user_id, message=reply)
+                                mem.save_message(session_id, "assistant", reply)
+                                mem.save_message(session_id, "system", "menu_consumed")
+                                return reply, meta
+                        except Exception:
+                            pass
+                except Exception:
+                    # Memory subsystem unavailable - ignore and continue
+                    pass
+        except Exception:
+            pass
+
+        # Save incoming user message to conversation memory (best-effort)
 
         composer = self._get_composer()
         if composer is None:
@@ -250,6 +381,66 @@ class BotFlow:
             # fallback to LLM path
             answer_text = "Sorry, I couldn't generate a reply right now."
             meta = {"confidence": 0.0, "citations": []}
+
+        # --- Subtle hotword-based human handoff (only when appropriate) ---
+        try:
+            from config.settings import settings
+            # normalize incoming cleaned message for handoff detection
+            user_lower = (cleaned or "").strip().lower()
+            # strong explicit requests -> immediate handoff
+            explicit_re = re.compile(r"\b(connect me to support|please connect.*support|connect me to an agent|escalate to support)\b", re.I)
+            # mild requests (e.g., "talk to support") are accepted only after options exhausted
+            mild_re = re.compile(r"\b(talk to support|talk to a support agent|support agent|human|talk to an agent)\b", re.I)
+
+            handoff = False
+            if explicit_re.search(user_lower):
+                handoff = True
+
+            # Mild requests: require low KB confidence or that we've already asked a clarifying question
+            elif mild_re.search(user_lower):
+                cond = False
+                try:
+                    if meta.get('low_confidence'):
+                        cond = True
+                except Exception:
+                    pass
+                try:
+                    if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
+                        from core.memory.memory_service import ConversationMemory
+                        mem = ConversationMemory()
+                        recent_msgs = mem.get_recent(session_id, limit=6)
+                        for m in recent_msgs:
+                            if m.get('role') == 'assistant' and re.search(r"could you provide|please provide|i don't have enough|one brief detail", m.get('text',''), re.I):
+                                cond = True
+                                break
+                except Exception:
+                    pass
+                if cond:
+                    handoff = True
+
+            if handoff:
+                # friendly, concise handoff confirmation
+                outgoing = "Please hold — connecting you to a support agent now. I'll include a short summary of this conversation so they can help you faster."
+                meta = meta or {}
+                meta['handoff'] = True
+                try:
+                    if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
+                        from core.memory.memory_service import ConversationMemory
+                        mem = ConversationMemory()
+                        mem.save_message(session_id, "assistant", outgoing)
+                        mem.save_message(session_id, "system", "handoff_requested")
+                except Exception:
+                    pass
+
+                try:
+                    self.whatsapp.send_message(user_id, message=outgoing)
+                except Exception:
+                    pass
+
+                return outgoing, meta
+        except Exception:
+            # If handoff detection fails, continue normal flow
+            pass
 
         # Save assistant response to memory (best-effort)
         try:
@@ -292,12 +483,48 @@ class BotFlow:
             clarify = (
                 "I don't have enough information to be confident. Could you provide one brief detail (e.g., patient age, exact error message, or how long this has been happening)?"
             )
-            if fallback_note and fallback_note not in outgoing:
-                outgoing = f"{outgoing}\n\n{fallback_note}\n\n{clarify}"
-            else:
-                # Ensure the clarify prompt is present and concise
-                if clarify not in outgoing:
-                    outgoing = f"{outgoing}\n\n{clarify}"
+
+            # If the composer already asked for clarification, or the outgoing contains a clarifying phrase, or the answer includes KB citations, avoid appending an extra clarify prompt.
+            already_asked = False
+            try:
+                if meta.get('low_confidence'):
+                    already_asked = True
+            except Exception:
+                pass
+
+            try:
+                if meta.get('citations'):
+                    # If there are citations, assume KB provided supporting context — don't force another clarification
+                    already_asked = True
+            except Exception:
+                pass
+
+            try:
+                if re.search(r"could you provide|please provide|i don't have enough|one brief detail", outgoing, re.I):
+                    already_asked = True
+            except Exception:
+                pass
+
+            # Prevent repeating the same clarify prompt multiple times by checking recent assistant messages
+            try:
+                from config.settings import settings
+                if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
+                    from core.memory.memory_service import ConversationMemory
+                    mem = ConversationMemory()
+                    recent_msgs = mem.get_recent(session_id, limit=6)
+                    for m in recent_msgs:
+                        if m.get('role') == 'assistant' and re.search(r"could you provide|please provide|i don't have enough|one brief detail", m.get('text',''), re.I):
+                            already_asked = True
+                            break
+            except Exception:
+                pass
+
+            if not already_asked:
+                if fallback_note and fallback_note not in outgoing:
+                    outgoing = f"{outgoing}\n\n{fallback_note}\n\n{clarify}"
+                else:
+                    if clarify not in outgoing:
+                        outgoing = f"{outgoing}\n\n{clarify}"
 
         # Clean, limit and safely truncate outgoing message for WhatsApp
         try:
