@@ -44,28 +44,31 @@ def chat_complete(
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    system_prompt: Optional[str] = None,
 ) -> str:
     """
     Create a chat completion with configurable model/temperature/tokens.
 
     Args:
         prompt: Fully constructed prompt string (system + user context is fine if you prefer).
-        model: Overrides settings.OPENAI_MODEL if provided.
+        model: Overrides settings.LLM_MODEL/settings.OPENAI_MODEL if provided.
         temperature: Overrides settings.LLM_TEMPERATURE if provided.
         max_tokens: Overrides settings.LLM_MAX_TOKENS if provided.
+        system_prompt: Overrides the default system prompt if provided.
 
     Returns:
         The assistant's message content (str). Empty string if not available.
     """
     client = get_openai()
 
-    use_model = model or settings.OPENAI_MODEL
+    use_model = model or getattr(settings, "LLM_MODEL", None) or settings.OPENAI_MODEL
     use_temp = settings.LLM_TEMPERATURE if temperature is None else temperature
     use_max_tokens = settings.LLM_MAX_TOKENS if max_tokens is None else max_tokens
 
-    # You can also move your system prompt here if you want a global policy guard.
+    sys_prompt = system_prompt or "You are a helpful assistant. Respond naturally, clearly, and safely."
+
     messages = [
-        {"role": "system", "content": "Be accurate, concise, actionable, and policy-compliant."},
+        {"role": "system", "content": sys_prompt},
         {"role": "user", "content": prompt},
     ]
 
