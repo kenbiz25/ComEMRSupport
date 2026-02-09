@@ -29,3 +29,6 @@ kb/
 
 # Ngrok session files
 *.ngrok.log
+# runtime artifacts (do not commit)
+core/memory/sessions/*.jsonl
+logs/*.jsonl
