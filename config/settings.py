@@ -85,7 +85,7 @@ class Settings:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
     # Default LLM (Chat)
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
     LLM_MODEL = os.getenv("LLM_MODEL", OPENAI_MODEL)
     LLM_TEMPERATURE = _to_float(os.getenv("LLM_TEMPERATURE"), 0.3)
     LLM_MAX_TOKENS = _to_int(os.getenv("LLM_MAX_TOKENS"), 300)
