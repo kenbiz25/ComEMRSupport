@@ -1,24 +1,33 @@
-# --- WhatsApp Gateway Routers ---
-from archive.apps.whatsapp_gateway.routes import router as whatsapp_gateway_router
-# --- Register Routers ---
-app.include_router(whatsapp_gateway_router)
 # app.py
 
 # --- Fix for Windows / uvicorn module import issues ---
 import sys
 from pathlib import Path
-
-# Ensure project root is in Python path
 sys.path.append(str(Path(__file__).parent.resolve()))
 
 # --- Standard imports ---
 import os
+import json
 import shutil
 import tempfile
 import logging
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request, Body
+import base64
+from datetime import datetime
+from typing import Optional, Tuple
+
+import httpx
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    UploadFile,
+    File,
+    Request,
+    Body,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
 
 # --- Core services ---
 from core.knowledge.store_faiss import FaissStore
@@ -41,9 +50,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ComEMR")
 
 # --- Initialize FastAPI ---
-app = FastAPI(title="ComEMR Support", version="1.2.0")
-# Configure CORS from settings; default is an empty allowlist for safety
-from config.settings import settings
+app = FastAPI(title="ComEMR Support", version="1.3.0")
+
+# --- CORS ---
 if getattr(settings, "ALLOWED_ORIGINS", None):
     app.add_middleware(
         CORSMiddleware,
@@ -51,144 +60,298 @@ if getattr(settings, "ALLOWED_ORIGINS", None):
         allow_headers=["*"],
         allow_methods=["*"],
     )
-else:
-    # Do not add CORSMiddleware in production by default (safer). Configure ALLOWED_ORIGINS via env when needed.
-    pass
 
-# --- Shared Components ---
-# Determine embedding dimensionality from configured embedding model
+# ------------------------------------------------------------------
+# Shared Components
+# ------------------------------------------------------------------
 def _get_embedding_dim():
     em = (settings.EMBED_MODEL or "").lower()
-    if "text-embedding-3-small" in em:
-        return 1536
     if "text-embedding-3-large" in em:
         return 3072
-    # Fallback default
     return 1536
 
 EMBEDDING_DIM = _get_embedding_dim()
 
 faiss_store = FaissStore(dim=EMBEDDING_DIM)
-llm_service = LLMService(model=settings.LLM_MODEL, temperature=settings.LLM_TEMPERATURE)
+llm_service = LLMService(
+    model=settings.LLM_MODEL,
+    temperature=settings.LLM_TEMPERATURE,
+)
+
 whatsapp_service = WhatsAppService(
     phone_id=os.getenv("WHATSAPP_PHONE_ID", ""),
-    token=os.getenv("META_WHATSAPP_TOKEN", "")
+    token=os.getenv("META_WHATSAPP_TOKEN", ""),
 )
 
 bot = BotFlow(faiss_store, llm_service, whatsapp_service)
+app.state.bot = bot
 
-# --- Startup Diagnostics ---
+# ------------------------------------------------------------------
+# Language behavior: understand Krio / any language, but reply in English
+# ------------------------------------------------------------------
+_ENGLISH_REPLY_HINT = "\n\n[Instruction: Reply in English.]\n"
+
+_KRIO_MARKERS = {
+    "wetin", "una", "mek", "nor", "dey", "na", "pikin", "boku", "tin",
+    "dem", "leh", "abeg", "sef", "kushe", "kusheh", "how di bodi",
+    "how di body", "a wan", "a go", "a de", "e don"
+}
+
+def _looks_like_krio_or_non_english(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    if any(m in t for m in _KRIO_MARKERS):
+        return True
+    non_ascii = sum(1 for ch in t if ord(ch) > 127)
+    return non_ascii >= 3
+
+def _ensure_english_reply_hint(user_text: str) -> str:
+    if not user_text:
+        return user_text
+    # enforce English replies consistently (Krio or any language)
+    return user_text + _ENGLISH_REPLY_HINT
+
+# ------------------------------------------------------------------
+# WhatsApp Media Helpers (Graph download by media_id)
+# ------------------------------------------------------------------
+async def _download_whatsapp_media(media_id: str) -> Tuple[bytes, str]:
+    """
+    Cloud API media retrieval pattern:
+    1) GET /{media_id} -> returns {url, mime_type}
+    2) GET url -> returns bytes (requires auth header)
+    """
+    token = os.getenv("META_WHATSAPP_TOKEN", "")
+    if not token:
+        raise RuntimeError("META_WHATSAPP_TOKEN missing")
+
+    api_ver = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        meta = await client.get(
+            f"https://graph.facebook.com/{api_ver}/{media_id}",
+            headers=headers,
+        )
+        meta.raise_for_status()
+        mjson = meta.json()
+        media_url = mjson.get("url")
+        mime_type = mjson.get("mime_type") or "application/octet-stream"
+        if not media_url:
+            raise RuntimeError("Media URL missing from Graph response")
+
+        blob = await client.get(media_url, headers=headers)
+        blob.raise_for_status()
+        return blob.content, mime_type
+
+def _guess_ext_from_mime(mime: str, default: str) -> str:
+    m = (mime or "").lower()
+    if "audio/ogg" in m or "opus" in m:
+        return ".ogg"
+    if "audio/mpeg" in m or "audio/mp3" in m:
+        return ".mp3"
+    if "audio/wav" in m:
+        return ".wav"
+    if "image/png" in m:
+        return ".png"
+    if "image/webp" in m:
+        return ".webp"
+    if "image/jpeg" in m or "image/jpg" in m:
+        return ".jpg"
+    return default
+
+def _safe_send_text(to: str, text: str):
+    try:
+        if hasattr(whatsapp_service, "send_text"):
+            whatsapp_service.send_text(to, text)
+        elif hasattr(whatsapp_service, "send_message"):
+            whatsapp_service.send_message(to, text)
+        else:
+            if HAS_WHATSAPP_ADAPTER:
+                send_whatsapp_text(to, text)
+    except Exception:
+        logger.exception("Failed to send WhatsApp text")
+
+# ------------------------------------------------------------------
+# OpenAI Helpers: Whisper transcription + Vision screenshot analysis
+# ------------------------------------------------------------------
+async def _transcribe_audio_bytes(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
+    """
+    OpenAI Whisper transcription endpoint.
+    """
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY missing")
+
+    whisper_model = os.getenv("OPENAI_WHISPER_MODEL", "whisper-1")
+
+    files = {"file": (filename, audio_bytes)}
+    data = {"model": whisper_model}
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            data=data,
+            files=files,
+        )
+        r.raise_for_status()
+        return (r.json().get("text") or "").strip()
+
+def _downscale_image_if_possible(image_bytes: bytes, mime_type: str) -> Tuple[bytes, str]:
+    """
+    Optional: downscale large screenshots to speed up vision and reduce cost.
+    Uses Pillow if available. If Pillow missing or fails, returns original bytes.
+    """
+    try:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+        img = img.convert("RGB")
+        max_w = int(os.getenv("VISION_MAX_WIDTH", "1280"))
+        if img.width > max_w:
+            ratio = max_w / float(img.width)
+            new_h = int(img.height * ratio)
+            img = img.resize((max_w, new_h))
+
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=int(os.getenv("VISION_JPEG_QUALITY", "85")))
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        return image_bytes, mime_type or "image/jpeg"
+
+async def _analyze_image_bytes(image_bytes: bytes, mime_type: str) -> str:
+    """
+    Vision analysis for screenshots:
+    - Extract visible error text (OCR-like)
+    - Identify screen context
+    - Suggest next steps
+    Always in English.
+    """
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY missing")
+
+    # Optional downscale/compress
+    image_bytes, mime_type = _downscale_image_if_possible(image_bytes, mime_type)
+
+    # data url
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{mime_type};base64,{b64}"
+
+    vision_model = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+
+    prompt = (
+        "You are a tech support assistant for ComEMR/SPICE. Analyze the screenshot.\n"
+        "Return:\n"
+        "1) Visible error messages (verbatim if possible)\n"
+        "2) What screen/page this appears to be\n"
+        "3) What the user is likely trying to do\n"
+        "4) The best fix / next steps (short, actionable)\n"
+        "Reply in English."
+    )
+
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        "temperature": 0.2,
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+        )
+        r.raise_for_status()
+        return (r.json()["choices"][0]["message"].get("content") or "").strip()
+
+# ------------------------------------------------------------------
+# Startup diagnostics (and KB folders for smoother ops)
+# ------------------------------------------------------------------
 @app.on_event("startup")
 def startup_diag():
-    # Log presence of critical configuration without revealing secrets
-    token = os.getenv("META_WHATSAPP_TOKEN", "")
-    phone_id = os.getenv("WHATSAPP_PHONE_ID", "")
-    api_ver = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    logger.info("WhatsApp config: API version=%s | token_configured=%s | phone_id_present=%s", api_ver, bool(token), bool(phone_id))
-    if not token or not phone_id:
-        logger.warning("META_WHATSAPP_TOKEN or WHATSAPP_PHONE_ID missing — outbound messaging will be disabled")
+    logger.info(
+        "WhatsApp config: token=%s phone_id=%s",
+        bool(os.getenv("META_WHATSAPP_TOKEN")),
+        bool(os.getenv("WHATSAPP_PHONE_ID")),
+    )
+
+    # Soft ops: ensure logs folder exists
     try:
-        logger.info(f"Loaded FAISS KB with {len(faiss_store.docs)} documents")
+        Path("logs").mkdir(parents=True, exist_ok=True)
     except Exception:
-        logger.info("Loaded FAISS KB (size unknown)")
+        pass
 
-
-# --- Health Check ---
+# ------------------------------------------------------------------
+# Health
+# ------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# --- WhatsApp Webhook Verification (GET) ---
+# ------------------------------------------------------------------
+# WhatsApp Webhook Verification (GET)
+# ------------------------------------------------------------------
 @app.get("/whatsapp/webhook", tags=["WhatsApp Gateway"])
-def whatsapp_webhook_verify(mode: str = Query(None), challenge: str = Query(None), verify_token: str = Query(None)):
-    # Meta/WhatsApp verification handshake
-    if mode == "subscribe" and verify_token == settings.META_VERIFY_TOKEN:
-        return PlainTextResponse(content=challenge or "")
-    raise HTTPException(status_code=403, detail="Verification token mismatch")
+async def whatsapp_webhook_verify(request: Request):
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
 
+    if mode == "subscribe" and token == settings.META_VERIFY_TOKEN:
+        return Response(content=challenge or "", media_type="text/plain")
 
-# Utilities for webhook parsing and diagnostics
-import json
-from datetime import datetime
-from pathlib import Path
+    return Response(status_code=403)
 
+# ------------------------------------------------------------------
+# Utilities for webhook diagnostics
+# ------------------------------------------------------------------
 _LOG_UNMATCHED = Path("logs/unmatched_webhooks.jsonl")
 
-
 def _redact_payload(obj: dict) -> dict:
-    """Redact sensitive-looking keys or token-like values from a payload for safe logging.
-
-    - Keys containing secret-like substrings are redacted entirely.
-    - String values that look like long tokens are masked.
-    - Works recursively for dict/list values.
-    """
-    SENSITIVE_KEY_SUBSTRS = (
-        "token",
-        "access",
-        "auth",
-        "password",
-        "api_key",
-        "apikey",
-        "api-key",
-        "authorization",
-        "openai",
-        "secret",
-        "credential",
-        "client_secret",
+    SENSITIVE = (
+        "token", "access", "auth", "password",
+        "api_key", "authorization", "secret"
     )
 
-    def _mask_value(v):
-        # Mask long token-like strings (alnum + punctuation) longer than 20 chars
-        if not isinstance(v, str):
-            return v
-        s = v.strip()
-        if len(s) >= 20 and all(c.isalnum() or c in "-_." for c in s):
-            # show last 4 chars only to help debugging without leaking secrets
-            return "[REDACTED]"  # safer than partial reveal
-        return s
-
-    def _redact(o):
+    def _walk(o):
         if isinstance(o, dict):
-            out = {}
-            for k, v in o.items():
-                lk = str(k).lower()
-                if any(sub in lk for sub in SENSITIVE_KEY_SUBSTRS):
-                    out[k] = "[REDACTED]"
-                else:
-                    out[k] = _redact(v)
-            return out
+            return {
+                k: "[REDACTED]" if any(s in str(k).lower() for s in SENSITIVE) else _walk(v)
+                for k, v in o.items()
+            }
         if isinstance(o, list):
-            return [_redact(i) for i in o]
-        if isinstance(o, str):
-            return _mask_value(o)
-        # primitives (int/float/bool/None)
+            return [_walk(i) for i in o]
+        if isinstance(o, str) and len(o) > 20:
+            return "[REDACTED]"
         return o
 
-    try:
-        return _redact(obj or {})
-    except Exception:
-        # Last resort: return minimal safe structure
-        try:
-            return {"payload_present": bool(obj)}
-        except Exception:
-            return {"payload_present": True}
+    return _walk(obj or {})
 
-
-def _dump_unmatched_payload(payload: dict | None):
+def _dump_unmatched_payload(payload):
     try:
         _LOG_UNMATCHED.parent.mkdir(parents=True, exist_ok=True)
-        entry = {
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "payload": _redact_payload(payload or {}),
-        }
         with open(_LOG_UNMATCHED, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.write(json.dumps({
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "payload": _redact_payload(payload),
+            }) + "\n")
     except Exception:
-        # Don't let logging failures break webhook handling
         logger.exception("Failed to dump unmatched payload")
 
-
-# --- WhatsApp Webhook Endpoint (POST) ---
+# ------------------------------------------------------------------
+# WhatsApp Webhook (POST) — CRASH‑SAFE + TEXT + AUDIO + IMAGES + ENGLISH REPLY
+# ------------------------------------------------------------------
 @app.post("/whatsapp/webhook", tags=["WhatsApp Gateway"])
 async def whatsapp_webhook(
     request: Request,
@@ -197,414 +360,205 @@ async def whatsapp_webhook(
     payload: dict = Body(None),
 ):
     try:
-        # Prefer query params if supplied; otherwise try JSON payload or form data
-        if not from_ or not body:
-            j = payload
-
-            # Quick top-level messages shortcut (helps some webhook variants)
-            if isinstance(j, dict) and j.get("messages"):
-                try:
-                    m0 = j.get("messages")[0]
-                    from_ = from_ or m0.get("from")
-                    body = body or m0.get("text", {}).get("body") or m0.get("body")
-                except Exception:
-                    pass
-
-            if j is None:
-                ctype = request.headers.get("content-type", "")
-                if "application/json" in ctype:
-                    try:
-                        j = await request.json()
-                    except Exception:
-                        j = None
-                elif "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
-                    try:
-                        form = await request.form()
-                        # form may not be a plain dict - extract robustly
-                        try:
-                            try:
-                                from_val = form.get("from")
-                            except Exception:
-                                from_val = form["from"] if "from" in form else None
-                            try:
-                                body_val = form.get("body")
-                            except Exception:
-                                body_val = form["body"] if "body" in form else None
-
-                            from_ = from_ or from_val
-                            body = body or body_val
-
-                            logger.debug("whatsapp webhook form values: from_val=%r body_val=%r", from_val, body_val)
-
-                            # Fallback: parse raw urlencoded body in case request.form() behaves unexpectedly
-                            if (not from_ or not body):
-                                try:
-                                    from urllib.parse import parse_qs
-                                    raw = await request.body()
-                                    # Log only the length of the raw body to avoid leaking content
-                                    logger.debug("raw body length: %d bytes", len(raw) if raw else 0)
-                                    parsed = parse_qs(raw.decode()) if raw else {}
-                                    logger.debug("parsed qs keys: %r", list(parsed.keys()))
-                                    from_ = from_ or (parsed.get("from", [None])[0])
-                                    body = body or (parsed.get("body", [None])[0])
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-            if j:
-                try:
-                    msg = None
-                    statuses = None
-                    # entry/changes path
-                    if isinstance(j, dict) and j.get("entry"):
-                        try:
-                            value = j.get("entry", [])[0].get("changes", [])[0].get("value", {})
-                            msg = value.get("messages", [])[0] if value.get("messages") else None
-                            statuses = value.get("statuses", []) if value.get("statuses") else []
-                        except Exception:
-                            msg = None
-                            statuses = None
-                    # top-level messages (secondary attempt)
-                    if msg is None and isinstance(j, dict) and j.get("messages"):
-                        try:
-                            msg = j.get("messages")[0]
-                        except Exception:
-                            msg = None
-                    # top-level statuses (secondary attempt)
-                    if (not statuses or statuses is None) and isinstance(j, dict) and j.get("statuses"):
-                        try:
-                            statuses = j.get("statuses")
-                        except Exception:
-                            statuses = None
-                    # single message object
-                    if msg is None and isinstance(j, dict) and j.get("message"):
-                        msg = j.get("message")
-
-                    if msg:
-                        from_ = from_ or msg.get("from")
-                        # Try to extract textual body if present
-                        body = body or (msg.get("text", {}) or {}).get("body") or msg.get("body")
-
-                        # If no text body but message contains audio/voice, attempt to fetch and transcribe
-                        if not body:
-                            try:
-                                audio_obj = msg.get("audio") or msg.get("voice") or {}
-                                audio_url = None
-                                media_id = None
-                                if isinstance(audio_obj, dict):
-                                    audio_url = audio_obj.get("url") or audio_obj.get("link")
-                                    media_id = audio_obj.get("id")
-                                # If audio URL present, download and transcribe. Use WhatsApp auth because lookaside URLs often require it.
-                                if audio_url:
-                                    import httpx
-                                    import tempfile
-                                    import os
-                                    try:
-                                        headers = {"Authorization": f"Bearer {whatsapp_service.token}"}
-                                        # Try the direct URL with auth first (lookaside URLs commonly need it)
-                                        try:
-                                            resp = httpx.get(audio_url, headers=headers, timeout=15.0)
-                                            resp.raise_for_status()
-                                        except Exception as e:
-                                            # If we have a media_id we can resolve the canonical media URL via Graph API
-                                            try:
-                                                if media_id:
-                                                    meta_resp = httpx.get(f"{whatsapp_service.base_media_url}/{media_id}", headers=headers, timeout=10.0)
-                                                    meta_resp.raise_for_status()
-                                                    mjson = meta_resp.json()
-                                                    resolved = mjson.get("url") or mjson.get("link")
-                                                    if resolved:
-                                                        resp = httpx.get(resolved, headers=headers, timeout=15.0)
-                                                        resp.raise_for_status()
-                                                    else:
-                                                        raise
-                                                else:
-                                                    raise
-                                            except Exception:
-                                                # Couldn't fetch the audio file
-                                                raise
-
-                                        ct = resp.headers.get("content-type", "") or ""
-                                        if "mpeg" in ct or "mp3" in ct:
-                                            ext = ".mp3"
-                                        elif "wav" in ct:
-                                            ext = ".wav"
-                                        else:
-                                            ext = ".ogg"
-                                        tf = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-                                        tf.write(resp.content)
-                                        tf.flush()
-                                        tf.close()
-                                        try:
-                                            from core.stt.whisper_client import transcribe_audio
-                                            transcript, conf, lang = transcribe_audio(tf.name)
-                                            if transcript and not transcript.startswith("[Audio received") and transcript.strip():
-                                                body = transcript.strip()
-                                            else:
-                                                body = "[Audio received; transcription unavailable]"
-                                        except Exception:
-                                            body = "[Audio received; transcription unavailable]"
-                                        finally:
-                                            try:
-                                                os.unlink(tf.name)
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        # If we fail to download or transcribe, fall back to a friendly placeholder
-                                        body = "[Audio received; transcription unavailable]"
-                                # If we have only a media id, attempt to resolve via WhatsApp media endpoint
-                                elif media_id:
-                                    try:
-                                        import httpx
-                                        headers = {"Authorization": f"Bearer {whatsapp_service.token}"}
-                                        meta_resp = httpx.get(f"{whatsapp_service.base_media_url}/{media_id}", headers=headers, timeout=10.0)
-                                        meta_resp.raise_for_status()
-                                        mjson = meta_resp.json()
-                                        audio_url = mjson.get("url") or mjson.get("link")
-                                        if audio_url:
-                                            # download/transcribe using auth
-                                            resp = httpx.get(audio_url, headers=headers, timeout=15.0)
-                                            resp.raise_for_status()
-                                            ct = resp.headers.get("content-type", "") or ""
-                                            ext = ".ogg"
-                                            if "mpeg" in ct or "mp3" in ct:
-                                                ext = ".mp3"
-                                            elif "wav" in ct:
-                                                ext = ".wav"
-                                            tf = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-                                            tf.write(resp.content)
-                                            tf.flush()
-                                            tf.close()
-                                            try:
-                                                from core.stt.whisper_client import transcribe_audio
-                                                transcript, conf, lang = transcribe_audio(tf.name)
-                                                if transcript and not transcript.startswith("[Audio received") and transcript.strip():
-                                                    body = transcript.strip()
-                                                else:
-                                                    body = "[Audio received; transcription unavailable]"
-                                            except Exception:
-                                                body = "[Audio received; transcription unavailable]"
-                                            finally:
-                                                try:
-                                                    os.unlink(tf.name)
-                                                except Exception:
-                                                    pass
-                                        else:
-                                            body = "[Audio received; transcription unavailable]"
-                                    except Exception:
-                                        body = "[Audio received; transcription unavailable]"
-                            except Exception:
-                                # Ensure any audio processing errors don't cause webhook to fail
-                                body = "[Audio received; transcription unavailable]"
-
-                    # If this payload only contains statuses (delivery/read receipts), acknowledge and return 200
-                    if (not msg or msg is None) and statuses:
-                        try:
-                            # log statuses for observability; downstream processing can be added later
-                            for st in statuses:
-                                logger.info(f"WhatsApp status update received: {st}")
-                        except Exception:
-                            logger.exception("Failed to log statuses")
-                        return JSONResponse(content={"status": "acknowledged", "statuses": statuses})
-
-                    # debug output during tests
-                    try:
-                        print("[DEBUG] webhook parse -> j=", j)
-                        logger.debug("webhook parse: msg_present=%s from=%s body_len=%s", bool(msg), bool(from_), len(body) if body else 0)
-                    except Exception:
-                        pass
-                except Exception:
-                    # Not the WhatsApp structure we expect
-                    pass
-
-        # Normalize 'from' when '+' becomes space in query strings (e.g. +254 -> ' 254')
-        if from_:
-            fstr = str(from_)
-            if fstr.startswith(" "):
-                candidate = fstr.strip()
-                if candidate.isdigit():
-                    from_ = "+" + candidate
-                else:
-                    from_ = candidate
-            else:
-                from_ = fstr
-
-        if not from_ or not body:
-            # Try one more time: parse raw body as JSON and attempt to extract
+        j = payload
+        if j is None:
             try:
-                raw = await request.body()
-                if raw:
-                    try:
-                        obj = json.loads(raw.decode())
-                        if isinstance(obj, dict) and obj.get("messages"):
-                            try:
-                                m = obj.get("messages")[0]
-                                from_ = from_ or m.get("from")
-                                body = body or m.get("text", {}).get("body") or m.get("body")
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                j = await request.json()
             except Exception:
-                pass
+                j = None
 
-            if not from_ or not body:
-                # Dump unmatched payloads for debugging
-                try:
-                    p = payload
-                    if p is None and "application/json" in (request.headers.get("content-type", "")):
-                        try:
-                            p = await request.json()
-                        except Exception:
-                            p = None
-                    if p is None:
-                        # try raw body parse
-                        try:
-                            raw = await request.body()
-                            if raw:
-                                try:
-                                    p = json.loads(raw.decode())
-                                except Exception:
-                                    p = {"raw": raw.decode(errors="ignore")}
-                        except Exception:
-                            p = None
-                    _dump_unmatched_payload(p)
-                except Exception:
-                    logger.exception("Failed to dump unmatched payload during 422 handling")
-                raise HTTPException(status_code=422, detail="Missing 'from' or 'body'")
-
-        # Prefer app-scoped bot (tests may set app.bot) otherwise use module-level bot
-        handler_bot = getattr(request.app, "bot", None) or bot
+        # ACK non-message payloads (statuses, receipts, etc.)
         try:
-            # Prefer calling with session_id kwarg if supported by the handler
-            handler_bot.handle_message(from_, body, session_id=from_)
+            if isinstance(j, dict) and j.get("entry"):
+                value = j["entry"][0]["changes"][0]["value"]
+                if value.get("statuses") and not value.get("messages"):
+                    return JSONResponse(content={"status": "acknowledged"})
+        except Exception:
+            pass
+
+        # Extract message object
+        msg = None
+        if isinstance(j, dict):
+            if j.get("entry"):
+                value = j["entry"][0]["changes"][0]["value"]
+                if value.get("messages"):
+                    msg = value["messages"][0]
+            elif j.get("messages"):
+                msg = j["messages"][0]
+
+        if not msg:
+            _dump_unmatched_payload(j)
+            return JSONResponse(content={"status": "acknowledged"})
+
+        msg_type = msg.get("type")
+        from_ = from_ or msg.get("from")
+
+        logger.info("Incoming WhatsApp message: type=%s from=%s", msg_type, from_)
+
+        # ---- TEXT / INTERACTIVE ----
+        text_body = (msg.get("text") or {}).get("body")
+        interactive = msg.get("interactive") or {}
+        button_text = (msg.get("button") or {}).get("text")
+        body = body or text_body or \
+            (interactive.get("button_reply") or {}).get("title") or \
+            (interactive.get("list_reply") or {}).get("title") or \
+            button_text
+
+        # ---- AUDIO (voice notes) ----
+        if (not body) and (msg_type == "audio"):
+            media_id = (msg.get("audio") or {}).get("id")
+            if media_id:
+                try:
+                    audio_bytes, mime = await _download_whatsapp_media(media_id)
+                    ext = _guess_ext_from_mime(mime, ".ogg")
+                    transcript = await _transcribe_audio_bytes(audio_bytes, filename=f"voice{ext}")
+                    if transcript:
+                        body = transcript
+                    else:
+                        _safe_send_text(from_, "I received your voice note but couldn’t transcribe it. Please type your question.")
+                        return JSONResponse(content={"status": "acknowledged"})
+                except Exception:
+                    logger.exception("Audio transcription failed")
+                    _safe_send_text(from_, "I received your voice note but couldn’t transcribe it. Please type your question.")
+                    return JSONResponse(content={"status": "acknowledged"})
+
+        # ---- IMAGES / SCREENSHOTS ----
+        # WhatsApp sends screenshots as type=image (sometimes as type=document with image mime)
+        if (not body) and (msg_type == "image"):
+            media_id = (msg.get("image") or {}).get("id")
+            caption = (msg.get("image") or {}).get("caption")
+            if media_id:
+                try:
+                    img_bytes, mime = await _download_whatsapp_media(media_id)
+                    insight = await _analyze_image_bytes(img_bytes, mime)
+                    combined = ""
+                    if caption:
+                        combined += f"User caption: {caption}\n"
+                    combined += f"Screenshot analysis: {insight}"
+                    body = combined
+                except Exception:
+                    logger.exception("Image analysis failed")
+                    _safe_send_text(from_, "I received the screenshot, but I couldn’t read it clearly. Please type the error message or resend a clearer screenshot.")
+                    return JSONResponse(content={"status": "acknowledged"})
+
+        # Document uploads: if image is sent as a document attachment (common for screenshots)
+        if (not body) and (msg_type == "document"):
+            doc = msg.get("document") or {}
+            media_id = doc.get("id")
+            mime = (doc.get("mime_type") or "").lower()
+            caption = doc.get("caption") or doc.get("filename")
+            if media_id and mime.startswith("image/"):
+                try:
+                    img_bytes, real_mime = await _download_whatsapp_media(media_id)
+                    insight = await _analyze_image_bytes(img_bytes, real_mime or mime)
+                    combined = ""
+                    if caption:
+                        combined += f"User caption/filename: {caption}\n"
+                    combined += f"Screenshot analysis: {insight}"
+                    body = combined
+                except Exception:
+                    logger.exception("Document-image analysis failed")
+                    _safe_send_text(from_, "I received the screenshot, but I couldn’t read it clearly. Please type the error message or resend a clearer screenshot.")
+                    return JSONResponse(content={"status": "acknowledged"})
+
+        # If still nothing usable, ACK + log payload
+        if not from_ or not body:
+            _dump_unmatched_payload(j)
+            return JSONResponse(content={"status": "acknowledged"})
+
+        # Enforce English reply behavior (Krio/audio/image -> English reply)
+        body_for_bot = _ensure_english_reply_hint(body)
+
+        handler_bot = getattr(request.app.state, "bot", None) or bot
+        try:
+            handler_bot.handle_message(from_, body_for_bot, session_id=from_)
         except TypeError:
-            # Fallback to legacy signature
-            handler_bot.handle_message(from_, body)
+            handler_bot.handle_message(from_, body_for_bot)
+
         return JSONResponse(content={"ok": True})
-    except HTTPException:
-        raise
+
     except Exception:
         logger.exception("WhatsApp webhook failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+# ------------------------------------------------------------------
+# Knowledge Base endpoints
+# ------------------------------------------------------------------
 @app.post("/kb/reindex", tags=["Knowledge Base"])
 def reindex():
     faiss_store.save()
-    logger.info(f"Reindexed FAISS KB with {len(faiss_store.docs)} docs")
     return {"reindexed": len(faiss_store.docs)}
 
 @app.post("/kb/reload", tags=["Knowledge Base"])
-def reload_kb(admin_key: str = Query(None, description="Optional admin key")):
-    """Reload FAISS/index files from disk into the running app without a restart.
-
-    If `KB_RELOAD_KEY` is set in the environment, the provided `admin_key` must match.
-    """
-    global faiss_store
-    try:
-        # optional security check
-        try:
-            from config.settings import settings
-            key = getattr(settings, "KB_RELOAD_KEY", "")
-        except Exception:
-            key = ""
-
-        if key and admin_key != key:
-            raise HTTPException(status_code=403, detail="Forbidden")
-
-        # Attempt to reload index/docs from disk
-        try:
-            faiss_store._load_if_exists()
-        except Exception:
-            # If the internal loader fails, fall back to recreating FaissStore
-            try:
-                faiss_store = FaissStore(dim=EMBEDDING_DIM)
-            except Exception:
-                logger.exception("Failed to recreate FaissStore during reload")
-                raise
-
-        logger.info(f"Reloaded FAISS store with {len(faiss_store.docs)} docs")
-        return JSONResponse(content={"reloaded": len(faiss_store.docs)})
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("KB reload failed")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
+def reload_kb(admin_key: str = Query(None)):
+    if settings.KB_RELOAD_KEY and admin_key != settings.KB_RELOAD_KEY:
+        raise HTTPException(status_code=403)
+    faiss_store._load_if_exists()
+    return {"reloaded": len(faiss_store.docs)}
 
 @app.get("/kb/status", tags=["Knowledge Base"])
 def kb_status():
-    """Return status about the in-memory FAISS/doc store and config.
+    return {
+        "doc_count": len(faiss_store.docs),
+        "embedding_dim": EMBEDDING_DIM,
+    }
 
-    Provides: doc_count, index/docs paths and mtimes (ISO), KB dir, namespace, embedding dim
-    """
-    try:
-        from config.settings import settings
-        status = {}
-        if hasattr(faiss_store, "get_status"):
-            status = faiss_store.get_status()
-        else:
-            status = {"doc_count": len(getattr(faiss_store, "docs", []))}
-
-        # Convert mtimes to ISO strings (UTC)
-        import datetime
-        def _to_iso(m):
-            try:
-                return datetime.datetime.utcfromtimestamp(float(m)).isoformat() + "Z" if m else None
-            except Exception:
-                return None
-
-        status["index_mtime_iso"] = _to_iso(status.get("index_mtime"))
-        status["docs_mtime_iso"] = _to_iso(status.get("docs_mtime"))
-        status["kb_dir"] = getattr(settings, "KB_DIR", None)
-        status["namespace"] = getattr(settings, "KB_NAMESPACE", None)
-        status["embedding_dim"] = EMBEDDING_DIM
-
-        return JSONResponse(content=status)
-    except Exception:
-        logger.exception("Failed to retrieve KB status")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-# --- RAG Ask Endpoint ---
+# ------------------------------------------------------------------
+# /ask endpoint: multimodal support (audio + image) for internal testing
+# ------------------------------------------------------------------
 @app.post("/ask", tags=["RAG Multimodal"])
 async def ask(
-    query: str = Query(None, description="Text query"),
-    audio: UploadFile = File(None, description="Optional audio file (wav/mp3)"),
-    image: UploadFile = File(None, description="Optional image file (png/jpg)")
+    query: str = Query(None),
+    audio: UploadFile = File(None),
+    image: UploadFile = File(None),
 ):
     temp_dir = tempfile.mkdtemp()
-    audio_path, image_path = None, None
-
     try:
+        transcript: Optional[str] = None
+        image_insight: Optional[str] = None
+
+        # Audio -> transcript -> becomes query if query missing
         if audio:
-            audio_path = os.path.join(temp_dir, audio.filename)
+            audio_path = os.path.join(temp_dir, audio.filename or "audio.ogg")
             with open(audio_path, "wb") as f:
                 shutil.copyfileobj(audio.file, f)
+            try:
+                with open(audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                ext = Path(audio_path).suffix or ".ogg"
+                transcript = await _transcribe_audio_bytes(audio_bytes, filename=f"audio{ext}")
+                if (not query) and transcript:
+                    query = transcript
+            except Exception:
+                logger.exception("Audio transcription failed in /ask")
 
+        # Image -> insight -> becomes query if query missing
         if image:
-            image_path = os.path.join(temp_dir, image.filename)
+            image_path = os.path.join(temp_dir, image.filename or "image.png")
             with open(image_path, "wb") as f:
                 shutil.copyfileobj(image.file, f)
+            try:
+                with open(image_path, "rb") as f:
+                    img_bytes = f.read()
+                # best effort mime guess
+                mime = "image/png"
+                if image.filename:
+                    lf = image.filename.lower()
+                    if lf.endswith(".jpg") or lf.endswith(".jpeg"):
+                        mime = "image/jpeg"
+                    elif lf.endswith(".webp"):
+                        mime = "image/webp"
+                image_insight = await _analyze_image_bytes(img_bytes, mime)
+                if (not query) and image_insight:
+                    query = image_insight
+            except Exception:
+                logger.exception("Image analysis failed in /ask")
 
-        # Ask via LLM + FAISS KB
-        answer, meta = "", {}
-        if query:
-            # Placeholder embedding for now
-            docs = faiss_store.search(embedding=[0]*EMBEDDING_DIM, top_k=5)
-            answer = llm_service.generate_response(query, docs)
-            meta = {"retrieved_docs": len(docs)}
+        # RAG response (still uses placeholder embedding unless your FaissStore embeds internally)
+        docs = faiss_store.search(embedding=[0] * EMBEDDING_DIM, top_k=5)
+        answer = llm_service.generate_response(_ensure_english_reply_hint(query), docs) if query else ""
 
-        return JSONResponse(content={"answer": answer, "meta": meta})
-
-    except Exception:
-        logger.exception("/ask failed")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        return {"answer": answer, "docs": len(docs), "transcript": transcript, "image_insight": image_insight}
 
     finally:
-        try:
-            shutil.rmtree(temp_dir)
-        except Exception:
-            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
