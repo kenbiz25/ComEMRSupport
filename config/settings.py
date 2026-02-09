@@ -73,6 +73,8 @@ class Settings:
     # ==================== Knowledge Base ====================
     KB_NAMESPACE = os.getenv("KB_NAMESPACE", "default")
     KB_DIR = os.getenv("KB_DIR", "KB")
+    # Optional admin key to restrict KB reloads without restarting the app
+    KB_RELOAD_KEY = os.getenv("KB_RELOAD_KEY", "")
 
     # Vector search top‑k
     TOP_K = _to_int(os.getenv("TOP_K"), 3)
@@ -141,6 +143,8 @@ class Settings:
     ENABLE_WEB_SEARCH = _to_bool(os.getenv("ENABLE_WEB_SEARCH"), False)
     ENABLE_CONVERSATION_MEMORY = _to_bool(os.getenv("ENABLE_CONVERSATION_MEMORY"), True)
     ENABLE_HUMAN_HANDOFF = _to_bool(os.getenv("ENABLE_HUMAN_HANDOFF"), True)
+    # Show a structured short menu on the first interaction for users who have difficulty typing
+    ENABLE_FIRST_TOUCH_MENU = _to_bool(os.getenv("ENABLE_FIRST_TOUCH_MENU"), True)
 
     # ==================== Vector Memory / DB Backends ====================
     ENABLE_VECTOR_MEMORY = _to_bool(os.getenv("ENABLE_VECTOR_MEMORY"), True)

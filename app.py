@@ -1,3 +1,7 @@
+# --- WhatsApp Gateway Routers ---
+from archive.apps.whatsapp_gateway.routes import router as whatsapp_gateway_router
+# --- Register Routers ---
+app.include_router(whatsapp_gateway_router)
 # app.py
 
 # --- Fix for Windows / uvicorn module import issues ---
@@ -281,7 +285,120 @@ async def whatsapp_webhook(
 
                     if msg:
                         from_ = from_ or msg.get("from")
+                        # Try to extract textual body if present
                         body = body or (msg.get("text", {}) or {}).get("body") or msg.get("body")
+
+                        # If no text body but message contains audio/voice, attempt to fetch and transcribe
+                        if not body:
+                            try:
+                                audio_obj = msg.get("audio") or msg.get("voice") or {}
+                                audio_url = None
+                                media_id = None
+                                if isinstance(audio_obj, dict):
+                                    audio_url = audio_obj.get("url") or audio_obj.get("link")
+                                    media_id = audio_obj.get("id")
+                                # If audio URL present, download and transcribe. Use WhatsApp auth because lookaside URLs often require it.
+                                if audio_url:
+                                    import httpx
+                                    import tempfile
+                                    import os
+                                    try:
+                                        headers = {"Authorization": f"Bearer {whatsapp_service.token}"}
+                                        # Try the direct URL with auth first (lookaside URLs commonly need it)
+                                        try:
+                                            resp = httpx.get(audio_url, headers=headers, timeout=15.0)
+                                            resp.raise_for_status()
+                                        except Exception as e:
+                                            # If we have a media_id we can resolve the canonical media URL via Graph API
+                                            try:
+                                                if media_id:
+                                                    meta_resp = httpx.get(f"{whatsapp_service.base_media_url}/{media_id}", headers=headers, timeout=10.0)
+                                                    meta_resp.raise_for_status()
+                                                    mjson = meta_resp.json()
+                                                    resolved = mjson.get("url") or mjson.get("link")
+                                                    if resolved:
+                                                        resp = httpx.get(resolved, headers=headers, timeout=15.0)
+                                                        resp.raise_for_status()
+                                                    else:
+                                                        raise
+                                                else:
+                                                    raise
+                                            except Exception:
+                                                # Couldn't fetch the audio file
+                                                raise
+
+                                        ct = resp.headers.get("content-type", "") or ""
+                                        if "mpeg" in ct or "mp3" in ct:
+                                            ext = ".mp3"
+                                        elif "wav" in ct:
+                                            ext = ".wav"
+                                        else:
+                                            ext = ".ogg"
+                                        tf = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                                        tf.write(resp.content)
+                                        tf.flush()
+                                        tf.close()
+                                        try:
+                                            from core.stt.whisper_client import transcribe_audio
+                                            transcript, conf, lang = transcribe_audio(tf.name)
+                                            if transcript and not transcript.startswith("[Audio received") and transcript.strip():
+                                                body = transcript.strip()
+                                            else:
+                                                body = "[Audio received; transcription unavailable]"
+                                        except Exception:
+                                            body = "[Audio received; transcription unavailable]"
+                                        finally:
+                                            try:
+                                                os.unlink(tf.name)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        # If we fail to download or transcribe, fall back to a friendly placeholder
+                                        body = "[Audio received; transcription unavailable]"
+                                # If we have only a media id, attempt to resolve via WhatsApp media endpoint
+                                elif media_id:
+                                    try:
+                                        import httpx
+                                        headers = {"Authorization": f"Bearer {whatsapp_service.token}"}
+                                        meta_resp = httpx.get(f"{whatsapp_service.base_media_url}/{media_id}", headers=headers, timeout=10.0)
+                                        meta_resp.raise_for_status()
+                                        mjson = meta_resp.json()
+                                        audio_url = mjson.get("url") or mjson.get("link")
+                                        if audio_url:
+                                            # download/transcribe using auth
+                                            resp = httpx.get(audio_url, headers=headers, timeout=15.0)
+                                            resp.raise_for_status()
+                                            ct = resp.headers.get("content-type", "") or ""
+                                            ext = ".ogg"
+                                            if "mpeg" in ct or "mp3" in ct:
+                                                ext = ".mp3"
+                                            elif "wav" in ct:
+                                                ext = ".wav"
+                                            tf = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                                            tf.write(resp.content)
+                                            tf.flush()
+                                            tf.close()
+                                            try:
+                                                from core.stt.whisper_client import transcribe_audio
+                                                transcript, conf, lang = transcribe_audio(tf.name)
+                                                if transcript and not transcript.startswith("[Audio received") and transcript.strip():
+                                                    body = transcript.strip()
+                                                else:
+                                                    body = "[Audio received; transcription unavailable]"
+                                            except Exception:
+                                                body = "[Audio received; transcription unavailable]"
+                                            finally:
+                                                try:
+                                                    os.unlink(tf.name)
+                                                except Exception:
+                                                    pass
+                                        else:
+                                            body = "[Audio received; transcription unavailable]"
+                                    except Exception:
+                                        body = "[Audio received; transcription unavailable]"
+                            except Exception:
+                                # Ensure any audio processing errors don't cause webhook to fail
+                                body = "[Audio received; transcription unavailable]"
 
                     # If this payload only contains statuses (delivery/read receipts), acknowledge and return 200
                     if (not msg or msg is None) and statuses:
@@ -379,6 +496,77 @@ def reindex():
     faiss_store.save()
     logger.info(f"Reindexed FAISS KB with {len(faiss_store.docs)} docs")
     return {"reindexed": len(faiss_store.docs)}
+
+@app.post("/kb/reload", tags=["Knowledge Base"])
+def reload_kb(admin_key: str = Query(None, description="Optional admin key")):
+    """Reload FAISS/index files from disk into the running app without a restart.
+
+    If `KB_RELOAD_KEY` is set in the environment, the provided `admin_key` must match.
+    """
+    global faiss_store
+    try:
+        # optional security check
+        try:
+            from config.settings import settings
+            key = getattr(settings, "KB_RELOAD_KEY", "")
+        except Exception:
+            key = ""
+
+        if key and admin_key != key:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        # Attempt to reload index/docs from disk
+        try:
+            faiss_store._load_if_exists()
+        except Exception:
+            # If the internal loader fails, fall back to recreating FaissStore
+            try:
+                faiss_store = FaissStore(dim=EMBEDDING_DIM)
+            except Exception:
+                logger.exception("Failed to recreate FaissStore during reload")
+                raise
+
+        logger.info(f"Reloaded FAISS store with {len(faiss_store.docs)} docs")
+        return JSONResponse(content={"reloaded": len(faiss_store.docs)})
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("KB reload failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/kb/status", tags=["Knowledge Base"])
+def kb_status():
+    """Return status about the in-memory FAISS/doc store and config.
+
+    Provides: doc_count, index/docs paths and mtimes (ISO), KB dir, namespace, embedding dim
+    """
+    try:
+        from config.settings import settings
+        status = {}
+        if hasattr(faiss_store, "get_status"):
+            status = faiss_store.get_status()
+        else:
+            status = {"doc_count": len(getattr(faiss_store, "docs", []))}
+
+        # Convert mtimes to ISO strings (UTC)
+        import datetime
+        def _to_iso(m):
+            try:
+                return datetime.datetime.utcfromtimestamp(float(m)).isoformat() + "Z" if m else None
+            except Exception:
+                return None
+
+        status["index_mtime_iso"] = _to_iso(status.get("index_mtime"))
+        status["docs_mtime_iso"] = _to_iso(status.get("docs_mtime"))
+        status["kb_dir"] = getattr(settings, "KB_DIR", None)
+        status["namespace"] = getattr(settings, "KB_NAMESPACE", None)
+        status["embedding_dim"] = EMBEDDING_DIM
+
+        return JSONResponse(content=status)
+    except Exception:
+        logger.exception("Failed to retrieve KB status")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # --- RAG Ask Endpoint ---
 @app.post("/ask", tags=["RAG Multimodal"])
