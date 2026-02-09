@@ -32,3 +32,9 @@ kb/
 # runtime artifacts (do not commit)
 core/memory/sessions/*.jsonl
 logs/*.jsonl
+
+# env files
+.env
+.env.*
+*.env
+*.bak
