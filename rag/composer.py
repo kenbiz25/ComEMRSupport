@@ -2,12 +2,15 @@ from typing import Optional, List, Dict, Any, Tuple
 import os
 import pathlib
 import re
+import logging
 
 from config.settings import settings
 from .retriever import Retriever
+
 # Prefer importing the client module lazily at call time to allow tests to monkeypatch it
 import adapters.llm.openai_client as openai_client  # uses chat_complete via openai_client.chat_complete
-import logging
+
+logger = logging.getLogger(__name__)
 
 # Optional fallback readers
 try:
@@ -15,14 +18,18 @@ try:
 except Exception:
     Document = None
 
+# Prefer pypdf (recommended) and fallback to PyPDF2 if installed
 try:
-    from PyPDF2 import PdfReader
+    from pypdf import PdfReader  # type: ignore
 except Exception:
-    PdfReader = None
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:
+        PdfReader = None
 
 # Optional media processing
 try:
-    import openai
+    import openai  # NOTE: This may not be used if you rely on openai_client
 except Exception:
     openai = None
 
@@ -41,6 +48,7 @@ try:
 except Exception:
     pytesseract = None
 
+
 # -------- System Prompt --------
 def _load_system_prompt() -> str:
     brand = os.getenv("COMEMR_BRAND_NAME", getattr(settings, "COMEMR_BRAND_NAME", "ComEMR Support"))
@@ -50,6 +58,7 @@ def _load_system_prompt() -> str:
             return base.read_text(encoding="utf-8").strip()
     except Exception:
         pass
+
     return (
         f"You are {brand}. Provide accurate, concise answers in plain language. Be empathetic and helpful.\n"
         "- Keep answers short and crisp: prefer max 2-3 sentences or numbered steps for procedures.\n"
@@ -59,6 +68,7 @@ def _load_system_prompt() -> str:
         "- Do NOT mention internal system details (indexes, file paths) or include raw scores in replies.\n"
         "- Never reveal secrets, tokens, passwords, or private configuration.\n"
     )
+
 
 # -------- Guardrails --------
 def _default_guardrails(user_query: str, enabled: bool) -> Tuple[bool, str]:
@@ -74,6 +84,7 @@ def _default_guardrails(user_query: str, enabled: bool) -> Tuple[bool, str]:
         return True, "For safety and privacy, I can’t help reveal or transmit passwords. I can provide safe reset steps."
     return False, ""
 
+
 # -------- Context utils --------
 def _truncate_context(chunks: List[Dict[str, Any]], max_chars: int) -> List[Dict[str, Any]]:
     total = 0
@@ -87,23 +98,28 @@ def _truncate_context(chunks: List[Dict[str, Any]], max_chars: int) -> List[Dict
             kept.append(ch)
             total += ln
         else:
+            # small overflow allowance for short chunks
             if ln < 600 and total + ln <= max_chars + 600:
                 kept.append(ch)
             break
     return kept
 
+
 def _format_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Keep citations metadata-only; do not expose scores in UI.
     cites = []
     for i, ch in enumerate(chunks, start=1):
         cites.append({
             "id": ch.get("id") or f"chunk-{i}",
             "title": ch.get("title"),
-            "score": ch.get("score"),
+            "score": ch.get("score"),  # kept for debug/meta; UI sanitizer strips score patterns
         })
     return cites
 
+
 # -------- Media helpers --------
 def _audio_to_text(audio_path: str) -> str:
+    # Best-effort transcription (optional)
     if openai:
         try:
             with open(audio_path, "rb") as f:
@@ -111,6 +127,7 @@ def _audio_to_text(audio_path: str) -> str:
             return transcription.text.strip()
         except Exception:
             pass
+
     if sr:
         try:
             r = sr.Recognizer()
@@ -119,36 +136,34 @@ def _audio_to_text(audio_path: str) -> str:
             return r.recognize_google(audio_data)
         except Exception:
             pass
+
     return f"[Unable to transcribe audio: {audio_path}]"
 
+
 def _image_to_text(image_path: str) -> str:
+    # OCR first
     if pytesseract and Image:
         try:
             img = Image.open(image_path)
             return pytesseract.image_to_string(img).strip()
         except Exception:
             pass
-    if openai:
-        try:
-            with open(image_path, "rb") as img_file:
-                resp = openai.Image.create(model="gpt-image-caption-001", image=img_file)
-                return resp.data[0].caption if resp.data else ""
-        except Exception:
-            pass
+
     return f"[Unable to extract text from image: {image_path}]"
+
 
 # -------- Micro-Templates for common procedures --------
 MICRO_TEMPLATES = {
     "reset password": [
-        "Step 1: Open the comEMR app and click on 'Forgot Password'.",
-        "Step 2: Enter your registered phone number and submit.",
-        "Step 3: You will receive an SMS with a secure link.",
-        "Step 4: Click the link to open the password reset screen.",
-        "Step 5: Enter your new password. Must start with an uppercase letter, followed by lowercase letters and numbers (e.g., Jam332).",
-        "Step 6: Click 'Submit' to update your password. Login with your new credentials."
+        "1. Open the ComEMR app and tap 'Forgot Password'.",
+        "2. Enter your registered phone number and submit.",
+        "3. You will receive an SMS with a secure link.",
+        "4. Open the link and set a new password.",
+        "5. Create a strong password (e.g., Jam332) and tap Submit.",
+        "6. Login again using your new password."
     ],
-    # Add more templates here for account unlock, registration, etc.
 }
+
 
 def _match_micro_template(query: str) -> Optional[List[str]]:
     q = (query or "").lower()
@@ -157,27 +172,36 @@ def _match_micro_template(query: str) -> Optional[List[str]]:
             return MICRO_TEMPLATES[key]
     return None
 
+
 # -------- Intent Detection --------
+# Important: Use grouping to avoid regex precedence bugs.
+_GREETING_RE = re.compile(r"\b(hello|hi|hey|good morning|good afternoon|good evening)\b", re.IGNORECASE)
+_PROCEDURAL_RE = re.compile(r"\b(how to|steps?|procedure|guide|reset|install|update)\b", re.IGNORECASE)
+_META_RE = re.compile(r"\b(are you a bot|are you a robot|can i ask you|outside comemr|other things)\b", re.IGNORECASE)
+_FAQ_RE = re.compile(r"\b(what|who|when|where|why)\b", re.IGNORECASE)
+
+
 def _detect_intent(query: str) -> str:
-    q = (query or "").lower()
-    # Greeting
-    if re.search(r"\bhello|hi|hey\b", q):
+    q = (query or "").strip()
+    if not q:
+        return "general"
+    if _GREETING_RE.search(q):
         return "greeting"
-    # Procedural / how-to
-    elif re.search(r"how to|step|procedure|guide|reset|install", q):
+    if _PROCEDURAL_RE.search(q):
         return "procedural"
-    # Meta / yes-no or agent-capability questions
-    elif re.search(r"\bare you a bot\b|\bare you a robot\b|\bcan i ask you\b|\boutside comemr\b|\bother things\b", q):
+    if _META_RE.search(q):
         return "meta"
-    # FAQ style wh-questions
-    elif re.search(r"\bwhat|who|when|where|why\b", q):
+    if _FAQ_RE.search(q):
         return "faq"
     return "general"
+
 
 # -------- Output Sanitizer --------
 _PATH_PATTERN = re.compile(r"([A-Za-z]:\\[^ \n]+|\/[^ \n]+)", re.IGNORECASE)
 _BRACKET_CITE_PATTERN = re.compile(r"\[\s*\d+\s*\]")
 _INTERNAL_CONF_PATTERN = re.compile(r"(?i)i'm not fully confident.*?(?:\n|$)")
+_SCORE_PATTERN = re.compile(r"(?i)\bscore\s*[:=]\s*\d+(\.\d+)?\b")
+
 
 def _sanitize_text_ui(text: str, brand: str) -> str:
     if not text:
@@ -185,8 +209,10 @@ def _sanitize_text_ui(text: str, brand: str) -> str:
     text = _BRACKET_CITE_PATTERN.sub("", text)
     text = _PATH_PATTERN.sub("", text)
     text = _INTERNAL_CONF_PATTERN.sub("", text)
+    text = _SCORE_PATTERN.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
+
 
 # -------- Composer --------
 class RagComposer:
@@ -198,14 +224,17 @@ class RagComposer:
         top_k: Optional[int] = None,
         max_context_chars: Optional[int] = None,
     ):
-        self.llm_model = llm_model or getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")
+        self.llm_model = llm_model or getattr(settings, "OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o"))
         self.top_k = top_k or getattr(settings, "TOP_K", 3)
-        self.confidence_threshold = confidence_threshold or 0.45
+        self.confidence_threshold = confidence_threshold or getattr(settings, "ANSWER_CONFIDENCE_THRESHOLD", 0.45)
         self.max_context_chars = max_context_chars or 6000
         self.safeguard = safeguard
         self.retriever = Retriever(top_k=self.top_k)
         self.system_prompt = _load_system_prompt()
         self.brand = os.getenv("COMEMR_BRAND_NAME", "ComEMR Support")
+
+        # If true, do NOT return a "reset-like" greeting response.
+        self.suppress_hard_greeting = True
 
     def answer(
         self,
@@ -216,12 +245,13 @@ class RagComposer:
         session_id: Optional[str] = None,
         **kwargs
     ) -> Tuple[str, Dict[str, Any]]:
-        """Produce an answer and return meta including confidence, citations, and detected intent.
+        """
+        Produce an answer and return meta including confidence, citations, and detected intent.
 
         language: 'en' (default) or 'krio' to indicate user requested Krio mixing.
         session_id: optional session identifier used to fetch conversation memory summaries.
         """
-        query = query or ""
+        query = (query or "").strip()
 
         # 1️⃣ Handle audio/image
         if audio_path:
@@ -232,12 +262,11 @@ class RagComposer:
         # 1b️⃣ Conversation memory hint (best-effort)
         memory_summary = ""
         try:
-            from config.settings import settings
             if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
                 try:
                     from core.memory.memory_service import ConversationMemory
                     mem = ConversationMemory()
-                    memory_summary = mem.summarize(session_id)
+                    memory_summary = mem.summarize(session_id) or ""
                     if memory_summary:
                         query = f"[Conversation summary]: {memory_summary}\n\n{query}"
                 except Exception:
@@ -254,18 +283,33 @@ class RagComposer:
         micro_steps = _match_micro_template(query)
         if micro_steps:
             answer_text = "\n".join(micro_steps)
-            return answer_text, {"confidence": 1.0, "citations": [], "guarded": False, "intent": _detect_intent(query), "low_confidence": False}
+            return answer_text, {
+                "confidence": 1.0,
+                "citations": [],
+                "guarded": False,
+                "intent": _detect_intent(query),
+                "low_confidence": False
+            }
 
         # 4️⃣ Intent detection
         intent = _detect_intent(query)
-        if intent == "greeting":
-            return f"Hello! I’m {self.brand}. How can I assist you today?", {"confidence": 1.0, "citations": [], "guarded": False, "intent": intent, "low_confidence": False}
 
-        # Meta intent: short direct answers (do not use numbered lists)
+        # ✅ Fix: Greeting should NOT cause "reset"
+        if intent == "greeting":
+            if self.suppress_hard_greeting:
+                # Forward-moving prompt (WhatsApp-friendly)
+                msg = f"Hi! How can I help you with ComEMR today? (You can type 'menu' to see options.)"
+                return msg, {"confidence": 1.0, "citations": [], "guarded": False, "intent": intent, "low_confidence": False}
+            else:
+                return f"Hello! I’m {self.brand}. How can I assist you today?", {
+                    "confidence": 1.0, "citations": [], "guarded": False, "intent": intent, "low_confidence": False
+                }
+
+        # Meta intent: short direct answers
         if intent == "meta":
             meta_ans = (
                 f"I’m a virtual assistant for {self.brand}. I can help with ComEMR support — troubleshooting, how-tos, and guidance. "
-                "You can ask me about the app, connectivity, or common procedures."
+                "Tell me what you’re trying to do or what error you see."
             )
             return meta_ans, {"confidence": 1.0, "citations": [], "guarded": False, "intent": intent, "low_confidence": False}
 
@@ -289,12 +333,32 @@ class RagComposer:
         citations = _format_citations(context_chunks)
 
         # 8️⃣ Compose answer via LLM
-        low_confidence = not bool(filtered)
-        answer_text = self._compose_with_llm(query, context_chunks, low_confidence=low_confidence, language=language, session_id=session_id)
+        low_confidence = not bool(filtered) and not bool(context_chunks)
+
+        # If absolutely no context and query is short/ambiguous, guide instead of hallucinating.
+        if low_confidence and len(query) < 10:
+            return (
+                "I can help. Please describe the issue in one sentence (e.g., login error, sync failing, device problem), or type 'menu'.",
+                {"confidence": 0.0, "citations": [], "guarded": False, "intent": intent, "low_confidence": True}
+            )
+
+        answer_text = self._compose_with_llm(
+            query,
+            context_chunks,
+            low_confidence=low_confidence,
+            language=language,
+            session_id=session_id
+        )
 
         clean_answer = _sanitize_text_ui(answer_text, self.brand)
         max_conf = max([float(c.get("score", 0.0)) for c in context_chunks], default=0.0)
-        return clean_answer, {"confidence": max_conf, "citations": citations, "guarded": False, "intent": intent, "low_confidence": low_confidence}
+        return clean_answer, {
+            "confidence": max_conf,
+            "citations": citations,
+            "guarded": False,
+            "intent": intent,
+            "low_confidence": low_confidence
+        }
 
     def _compose_with_llm(
         self,
@@ -304,19 +368,18 @@ class RagComposer:
         language: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> str:
-        context_text = "\n\n".join([c.get("text", "") for c in context_chunks])
+        context_text = "\n\n".join([c.get("text", "") for c in context_chunks if c.get("text")])
 
         # Retrieve vector memory items if enabled and session_id provided
         memory_texts = []
         try:
-            from config.settings import settings
             if session_id and getattr(settings, "ENABLE_VECTOR_MEMORY", False):
                 try:
                     from core.memory.vector_memory import VectorMemory
                     vec = VectorMemory()
                     mem_items = vec.get_similar(session_id, query, top_k=getattr(settings, "MEMORY_VECTOR_TOP_K", 3))
                     if mem_items:
-                        memory_texts = [f"{m['role']}: {m['text']}" for m in mem_items]
+                        memory_texts = [f"{m.get('role','')}: {m.get('text','')}" for m in mem_items if m.get("text")]
                 except Exception:
                     pass
         except Exception:
@@ -324,47 +387,48 @@ class RagComposer:
 
         memory_section = ("Relevant memory:\n" + "\n".join(memory_texts) + "\n\n") if memory_texts else ""
 
-        # Additional guardrail instructions: prefer plain numbered lists, be tolerant of typos, and infer intent
+        # Krio mixing instruction
         lang_instruction = ""
-        if language == 'krio':
+        if language == "krio":
             lang_instruction = (
                 "\nNote: The user requested Krio. Reply mostly in English but include Krio so that roughly 40% of the reply is in Krio (by sentence count) and 60% in English. "
-                "Keep critical guidance primarily in English to ensure clarity for clinicians; use Krio for friendly phrasing or short clarifying sentences."
+                "Keep critical guidance primarily in English to ensure clarity; use Krio for friendly phrasing or short clarifying sentences."
             )
 
         prompt = f"""
-    User question:
-    {query}
+User question:
+{query}
 
-    {memory_section}Relevant context:
-    {context_text or '[No relevant context found]'}
+{memory_section}Relevant context:
+{context_text or '[No relevant context found]'}
 
-    Instructions:
-    - Answer clearly and concisely.
-    - Use natural, conversational language.
-    - For short direct answers (yes/no or single-line replies), do NOT use numbered lists; use a single plain sentence.
-    - Provide plain numbered steps (e.g., '1. Step one') only for procedural answers with multiple steps; avoid markdown bullets or emphasis.
-    - Be tolerant of minor typos and infer user intent; ask a clarifying question only if intent is unclear.
-    - Use friendly language where appropriate.
-    - Avoid internal paths, confidential info, or private data.
-    - If unsure, suggest safe next steps.
-    {lang_instruction}
-    """
+Instructions:
+- Answer clearly and concisely.
+- Use natural, conversational language.
+- For short direct answers (yes/no or single-line replies), do NOT use numbered lists; use a single plain sentence.
+- Provide plain numbered steps only for procedural answers with multiple steps.
+- Be tolerant of minor typos and infer user intent; ask a clarifying question only if intent is unclear.
+- Avoid internal paths, confidential info, or private data.
+- If unsure, suggest safe next steps.
+{lang_instruction}
+""".strip()
+
         if low_confidence:
-            prompt += "\nNote: KB confidence is low; do NOT hallucinate. If you cannot answer confidently, respond that you don't know and ask ONE concise clarifying question (1 sentence). You may provide brief general guidance labeled 'General guidance' if helpful.\n"
+            prompt += (
+                "\n\nNote: KB confidence is low; do NOT hallucinate. "
+                "If you cannot answer confidently, say you don't know and ask ONE concise clarifying question (1 sentence). "
+                "You may provide brief 'General guidance' if helpful."
+            )
 
         try:
-            # call the client module at runtime so tests can monkeypatch openai_client.chat_complete
             answer = openai_client.chat_complete(
                 prompt,
                 model=self.llm_model,
-                temperature=settings.LLM_TEMPERATURE,
-                max_tokens=settings.LLM_MAX_TOKENS,
+                temperature=getattr(settings, "LLM_TEMPERATURE", 0.2),
+                max_tokens=getattr(settings, "LLM_MAX_TOKENS", 450),
                 system_prompt=self.system_prompt,
             )
-            return answer.strip()
+            return (answer or "").strip()
         except Exception:
-            # Log full exception server-side but return a generic safe message to the user
-            logger = logging.getLogger(__name__)
             logger.exception("LLM chat completion failed")
             return "Sorry, an internal error occurred while generating the answer. Please try again later."
