@@ -10,7 +10,8 @@ def test_detect_krio_explicit():
 
 def test_detect_krio_token():
     bf = BotFlow(None, None, None)
-    assert bf._detect_krio('wetin na dis?') is True
+    # Tokens like 'wetin' should NOT auto-enable Krio; only explicit initiation enables Krio
+    assert bf._detect_krio('wetin na dis?') is False
 
 
 def test_detect_krio_negative():
