@@ -16,7 +16,9 @@ def test_compose_includes_krio_instruction(monkeypatch):
     monkeypatch.setattr(openai_client, 'chat_complete', dummy)
     rc = RagComposer(llm_model='gpt-test')
     rc._compose_with_llm('How are?', [], low_confidence=False, language='krio')
+    # Ensure the prompt mentions the Krio mixing instruction and approximate 40% guidance
     assert any('Krio' in c['prompt'] or 'krio' in c['prompt'].lower() for c in dummy.calls)
+    assert any('40' in c['prompt'] or 'forty' in c['prompt'].lower() for c in dummy.calls)
 
 
 def test_answer_returns_intent(monkeypatch):
