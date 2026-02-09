@@ -238,6 +238,40 @@ class FaissStore:
                 })
 
         logger.info(f"Search returned {len(results)} results for top_k={top_k}, namespace={ns}")
+
+    def get_status(self) -> dict:
+        """Return a small status summary for observability and /kb/status endpoint.
+
+        Keys returned: doc_count, index_file, index_mtime, docs_file, docs_mtime
+        """
+        info = {"doc_count": len(self.docs)}
+        try:
+            # index file info
+            if self.index_file and self.index_file.exists():
+                info["index_file"] = str(self.index_file)
+                try:
+                    info["index_mtime"] = float(self.index_file.stat().st_mtime)
+                except Exception:
+                    info["index_mtime"] = None
+            else:
+                info["index_file"] = None
+                info["index_mtime"] = None
+
+            # docs file info
+            if self.docs_file and self.docs_file.exists():
+                info["docs_file"] = str(self.docs_file)
+                try:
+                    info["docs_mtime"] = float(self.docs_file.stat().st_mtime)
+                except Exception:
+                    info["docs_mtime"] = None
+            else:
+                info["docs_file"] = None
+                info["docs_mtime"] = None
+
+            return info
+        except Exception:
+            logger.exception("Failed to get FaissStore status")
+            return {"doc_count": len(self.docs)}
         return results
 
     def size(self) -> int:
