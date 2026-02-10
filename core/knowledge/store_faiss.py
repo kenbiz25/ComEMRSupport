@@ -12,8 +12,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
+
 
 def _doc_uid(metadata: Dict[str, Any]) -> str:
     ns = metadata.get("namespace", "")
@@ -21,10 +23,17 @@ def _doc_uid(metadata: Dict[str, Any]) -> str:
     chunk_id = str(metadata.get("chunk_id", "0"))
     return f"{ns}|{doc_id}|{chunk_id}"
 
+
 class FaissStore:
     """A FAISS-backed store with an in-memory fallback when the `faiss` package is not available."""
 
-    def __init__(self, dim: int = 1536, index_dir: str = "core/faiss_index", namespace: str = None, overfetch: int = 5):
+    def __init__(
+        self,
+        dim: int = 1536,
+        index_dir: str = "core/faiss_index",
+        namespace: str = None,
+        overfetch: int = 5,
+    ):
         self.dim = dim
         self.index_dir = Path(index_dir)
         self.index_file = self.index_dir / "index.faiss"
@@ -33,14 +42,16 @@ class FaissStore:
         self.namespace_default = namespace
         self.overfetch = max(1, overfetch)
 
-        # If FAISS is available, create an IndexIDMap2 index for efficient similarity search.
         if faiss is not None:
-            self.index: faiss.Index = faiss.IndexIDMap2(faiss.IndexFlatIP(dim))
+            self.index: faiss.Index = faiss.IndexIDMap2(
+                faiss.IndexFlatIP(dim)
+            )
         else:
-            logger.warning("faiss is not installed; using in-memory search fallback for FaissStore")
+            logger.warning(
+                "faiss is not installed; using in-memory fallback"
+            )
             self.index = None
 
-        # Document storage & mappings (works for both backends)
         self.docs: List[Dict[str, Any]] = []
         self.uid_to_faiss_id: Dict[str, int] = {}
         self.faiss_id_to_pos: Dict[int, int] = {}
@@ -53,44 +64,47 @@ class FaissStore:
             if self.docs_file.exists():
                 with open(self.docs_file, "rb") as f:
                     self.docs = pickle.load(f)
-                # Rebuild mappings
+
                 self.uid_to_faiss_id.clear()
                 self.faiss_id_to_pos.clear()
+
                 for pos, d in enumerate(self.docs):
-                    faiss_id = d.get("faiss_id")
+                    fid = d.get("faiss_id")
                     uid = d.get("uid")
-                    if faiss_id is None or uid is None:
-                        continue
-                    self.faiss_id_to_pos[int(faiss_id)] = pos
-                    self.uid_to_faiss_id[str(uid)] = int(faiss_id)
-                # Load next id if available
+                    if fid is not None and uid is not None:
+                        self.faiss_id_to_pos[int(fid)] = pos
+                        self.uid_to_faiss_id[str(uid)] = int(fid)
+
                 if self.meta_file.exists():
                     with open(self.meta_file, "rb") as f:
                         meta = pickle.load(f)
-                        self.next_faiss_id = int(meta.get("next_faiss_id", self.next_faiss_id))
-                logger.info(f"Loaded {len(self.docs)} documents (in-memory)")
+                        self.next_faiss_id = int(
+                            meta.get("next_faiss_id", self.next_faiss_id)
+                        )
 
-                # If FAISS exists and index file present, try to load it as well
+                logger.info(f"Loaded {len(self.docs)} documents")
+
                 if faiss is not None and self.index_file.exists():
                     try:
                         idx = faiss.read_index(str(self.index_file))
                         if isinstance(idx, faiss.IndexIDMap2):
                             self.index = idx
-                            logger.info("Loaded FAISS index file")
-                        else:
-                            logger.warning("FAISS index on disk is not IndexIDMap2; using in-memory docs only")
+                            logger.info("Loaded FAISS index from disk")
                     except Exception as e:
-                        logger.warning(f"Failed to load FAISS index file: {e}")
+                        logger.warning(f"Failed loading FAISS index: {e}")
 
         except Exception as e:
-            logger.warning(f"Could not load index/docs: {e}. Starting fresh.")
+            logger.warning(f"Failed loading store: {e}")
             self._fresh_index()
 
     def _fresh_index(self):
         if faiss is not None:
-            self.index = faiss.IndexIDMap2(faiss.IndexFlatIP(self.dim))
+            self.index = faiss.IndexIDMap2(
+                faiss.IndexFlatIP(self.dim)
+            )
         else:
             self.index = None
+
         self.docs = []
         self.uid_to_faiss_id = {}
         self.faiss_id_to_pos = {}
@@ -98,18 +112,20 @@ class FaissStore:
 
     def save(self):
         _ensure_dir(self.index_dir)
-        # Save FAISS index only if present
+
         if faiss is not None and self.index is not None:
             try:
                 faiss.write_index(self.index, str(self.index_file))
             except Exception as e:
                 logger.warning(f"Failed to write FAISS index: {e}")
-        # Always save docs and next_faiss_id
+
         with open(self.docs_file, "wb") as f:
             pickle.dump(self.docs, f)
+
         with open(self.meta_file, "wb") as f:
             pickle.dump({"next_faiss_id": self.next_faiss_id}, f)
-        logger.info(f"Saved store with {len(self.docs)} docs.")
+
+        logger.info(f"Saved store with {len(self.docs)} docs")
 
     def upsert(self, content: str, metadata: Dict[str, Any], embedding: List[float]):
         if "namespace" not in metadata and self.namespace_default:
@@ -117,28 +133,22 @@ class FaissStore:
 
         uid = _doc_uid(metadata)
 
-        # Remove old doc if exists
         if uid in self.uid_to_faiss_id:
-            old_id = self.uid_to_faiss_id[uid]
-            self._remove_faiss_ids([old_id])
+            self._remove_faiss_ids([self.uid_to_faiss_id[uid]])
 
-        # Assign new FAISS id
         faiss_id = self.next_faiss_id
         self.next_faiss_id += 1
 
-        # Backend-specific storage
         if faiss is not None and self.index is not None:
             vec = np.asarray([embedding], dtype="float32")
             ids = np.asarray([faiss_id], dtype="int64")
             self.index.add_with_ids(vec, ids)
             stored_embedding = None
         else:
-            # Store normalized embedding for in-memory similarity
             arr = np.asarray(embedding, dtype=np.float32)
             norm = np.linalg.norm(arr)
             stored_embedding = (arr / norm).tolist() if norm else arr.tolist()
 
-        # Record metadata
         doc_record = {
             "uid": uid,
             "faiss_id": faiss_id,
@@ -152,21 +162,21 @@ class FaissStore:
         self.uid_to_faiss_id[uid] = faiss_id
         self.faiss_id_to_pos[faiss_id] = len(self.docs) - 1
 
-        logger.info(f"Upserted document {uid} with FAISS id {faiss_id}. Total docs: {len(self.docs)}")
+        logger.info(
+            f"Upserted document {uid} with FAISS id {faiss_id}. Total docs: {len(self.docs)}"
+        )
 
     def _remove_faiss_ids(self, ids: Iterable[int]) -> int:
         to_remove = [i for i in ids if i in self.faiss_id_to_pos]
         if not to_remove:
             return 0
 
-        # Backend-specific removal
         if faiss is not None and self.index is not None:
             try:
-                self.index.remove_ids(np.array(to_remove, dtype="int64"))
+                self.index.remove_ids(np.asarray(to_remove, dtype="int64"))
             except Exception as e:
                 logger.warning(f"Failed removing ids from FAISS index: {e}")
 
-        # Mark deleted in docs and remove mappings
         for fid in to_remove:
             pos = self.faiss_id_to_pos.pop(fid, None)
             if pos is not None:
@@ -174,18 +184,26 @@ class FaissStore:
                     "uid": f"deleted::{fid}",
                     "faiss_id": fid,
                     "text": "",
-                    "metadata": {}
+                    "metadata": {},
                 }
 
         for u, fid in list(self.uid_to_faiss_id.items()):
             if fid in to_remove:
                 self.uid_to_faiss_id.pop(u, None)
 
-        logger.info(f"Removed {len(to_remove)} FAISS ids: {to_remove}. Total docs: {len(self.docs)}")
+        logger.info(
+            f"Removed {len(to_remove)} FAISS ids: {to_remove}. Total docs: {len(self.docs)}"
+        )
         return len(to_remove)
 
-    def search(self, query_emb: List[float], top_k: int = 3, namespace: str = None, overfetch: int = None) -> List[Dict[str, Any]]:
-        # Early return if no docs
+    def search(
+        self,
+        query_emb: List[float],
+        top_k: int = 3,
+        namespace: str = None,
+        overfetch: int = None,
+    ) -> List[Dict[str, Any]]:
+
         if not self.docs:
             return []
 
@@ -193,7 +211,7 @@ class FaissStore:
         fetch_count = overfetch or self.overfetch
         fetch = min(top_k * fetch_count, len(self.docs))
 
-        results = []
+        results: List[Dict[str, Any]] = []
 
         if faiss is not None and self.index is not None:
             vec = np.asarray([query_emb], dtype="float32")
@@ -205,17 +223,18 @@ class FaissStore:
                 if pos is None:
                     continue
                 doc = self.docs[pos]
-                if ns and doc.get("namespace") != ns:
+                if ns and doc.get("metadata", {}).get("namespace") != ns:
                     continue
-                results.append({
-                    "text": doc.get("text", ""),
-                    "score": float(max(0, min(1, score))),
-                    "metadata": doc.get("metadata", {}),
-                })
+                results.append(
+                    {
+                        "text": doc.get("text", ""),
+                        "score": float(max(0, min(1, score))),
+                        "metadata": doc.get("metadata", {}),
+                    }
+                )
                 if len(results) >= top_k:
                     break
         else:
-            # In-memory similarity (dot product of normalized vectors)
             q = np.asarray(query_emb, dtype=np.float32)
             qn = np.linalg.norm(q)
             if qn:
@@ -231,49 +250,37 @@ class FaissStore:
                 scored.append((s, d))
             scored.sort(key=lambda x: x[0], reverse=True)
             for s, d in scored[:fetch]:
-                results.append({
-                    "text": d.get("text", ""),
-                    "score": float(max(0, min(1, s))),
-                    "metadata": d.get("metadata", {}),
-                })
+                results.append(
+                    {
+                        "text": d.get("text", ""),
+                        "score": float(max(0, min(1, s))),
+                        "metadata": d.get("metadata", {}),
+                    }
+                )
 
-        logger.info(f"Search returned {len(results)} results for top_k={top_k}, namespace={ns}")
+        logger.info(
+            f"Search returned {len(results)} results for top_k={top_k}, namespace={ns}"
+        )
+        return results  # ✅ CRITICAL FIX
 
     def get_status(self) -> dict:
-        """Return a small status summary for observability and /kb/status endpoint.
-
-        Keys returned: doc_count, index_file, index_mtime, docs_file, docs_mtime
-        """
         info = {"doc_count": len(self.docs)}
-        try:
-            # index file info
-            if self.index_file and self.index_file.exists():
-                info["index_file"] = str(self.index_file)
-                try:
-                    info["index_mtime"] = float(self.index_file.stat().st_mtime)
-                except Exception:
-                    info["index_mtime"] = None
-            else:
-                info["index_file"] = None
-                info["index_mtime"] = None
 
-            # docs file info
-            if self.docs_file and self.docs_file.exists():
-                info["docs_file"] = str(self.docs_file)
-                try:
-                    info["docs_mtime"] = float(self.docs_file.stat().st_mtime)
-                except Exception:
-                    info["docs_mtime"] = None
-            else:
-                info["docs_file"] = None
-                info["docs_mtime"] = None
+        if self.index_file.exists():
+            info["index_file"] = str(self.index_file)
+            info["index_mtime"] = float(self.index_file.stat().st_mtime)
+        else:
+            info["index_file"] = None
+            info["index_mtime"] = None
 
-            return info
-        except Exception:
-            logger.exception("Failed to get FaissStore status")
-            return {"doc_count": len(self.docs)}
-        return results
+        if self.docs_file.exists():
+            info["docs_file"] = str(self.docs_file)
+            info["docs_mtime"] = float(self.docs_file.stat().st_mtime)
+        else:
+            info["docs_file"] = None
+            info["docs_mtime"] = None
+
+        return info
 
     def size(self) -> int:
-        """Return the number of active (non-deleted) documents."""
         return len([d for d in self.docs if not d["uid"].startswith("deleted::")])
