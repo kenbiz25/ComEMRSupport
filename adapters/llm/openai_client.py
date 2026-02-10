@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import time
 import random
+import re
+from collections import Counter
 from typing import Optional, Dict, Any, Tuple
 
 from config.settings import settings
@@ -22,13 +24,18 @@ def get_openai() -> "OpenAI":
         except Exception as e:
             raise RuntimeError("openai package is not installed") from e
 
-        # Keep it consistent with your settings pattern
         _client = OpenAI(api_key=settings.OPENAI_API_KEY)
     return _client
 
 
-def _with_backoff(fn, *args, max_retries: int = 4, **kwargs):
-    """Simple retry with exponential backoff for transient OpenAI errors."""
+def _with_backoff(
+    fn,
+    *args,
+    max_retries: int = 5,
+    max_delay: float = 30.0,
+    **kwargs
+):
+    """Retry with exponential backoff + jitter for transient errors."""
     delay = 1.0
     for attempt in range(max_retries):
         try:
@@ -38,59 +45,100 @@ def _with_backoff(fn, *args, max_retries: int = 4, **kwargs):
                 raise
             sleep_for = delay + random.random() * 0.5
             time.sleep(sleep_for)
-            delay = min(delay * 2, 30.0)
+            delay = min(delay * 2, max_delay)
 
 
 # ============================================================
-# Language Detection (non-blocking) + Krio Normalization
+# Language Detection + Krio Normalization (for RAG + analytics)
 # ============================================================
+
+_WORD_RE = re.compile(r"\b[\w']+\b", re.UNICODE)
+
 
 def detect_language(text: str) -> Tuple[str, float]:
     """
-    Best-effort lightweight language detection for analytics and behavior.
-    Returns: (lang_label, confidence)
-      - 'en', 'krio', 'sw', 'unknown'
-    This does NOT limit or block any language.
+    Lightweight language detection using scoring + negative signals.
+    Returns: (lang_label, confidence) — 'en', 'krio', 'sw', 'unknown'
+    NOTE: Detection is used for analytics + pre-RAG normalization ONLY.
+          It MUST NOT change the bot's output language (English-only).
     """
-    if not text:
-        return ("unknown", 0.0)
+    if not text or len(text.strip()) < 6:
+        return "unknown", 0.0
 
     t = text.lower()
+    words = _WORD_RE.findall(t)
+    if len(words) < 2:
+        return "unknown", 0.35
 
-    # Krio markers (heuristic)
-    krio_markers = [
-        "wetin", "nor", "dey", "sabi", "pikin", "una",
-        "tori", "leh", "wey", "sef", "mak", "na", "fo"
-    ]
-    krio_hits = sum(1 for w in krio_markers if w in t)
-    if krio_hits >= 1:
-        conf = min(0.55 + 0.10 * krio_hits, 0.90)
-        return ("krio", conf)
+    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
 
-    # Swahili markers (light heuristic; extend later if needed)
-    sw_markers = ["habari", "sawa", "tafadhali", "nisaidie", "asante", "kwanini", "vipi", "je"]
-    sw_hits = sum(1 for w in sw_markers if w in t)
-    if sw_hits >= 1:
-        conf = min(0.55 + 0.10 * sw_hits, 0.90)
-        return ("sw", conf)
+    # Krio positive signals (weighted words + some bigrams)
+    # Keep short tokens ('na', 'fo') but ONLY match via word/bigram lists to avoid substring false positives.
+    krio_pos = Counter({
+        "wetin": 12, "nor": 8, "dey": 10, "sabi": 9, "pikin": 7, "una": 6,
+        "tori": 5, "na": 8, "fo": 6, "leh": 5, "wey": 7, "sef": 5, "mek": 6,
+        "na so": 4, "wetin be": 5, "for na": 3, "how far": 4,
+    })
 
-    # English markers
-    en_markers = ["the", "and", "is", "are", "what", "how", "please", "help", "can you"]
-    en_hits = sum(1 for w in en_markers if w in t)
-    if en_hits >= 1:
-        conf = min(0.55 + 0.08 * en_hits, 0.90)
-        return ("en", conf)
+    # English strong function words (negative signal for Krio)
+    en_strong = {
+        "the": 15, "and": 12, "is": 10, "are": 9, "that": 8, "with": 7,
+        "they": 6, "this": 6, "have": 5, "for": 5, "you": 5,
+    }
 
-    return ("unknown", 0.35)
+    # Swahili (simple)
+    sw_pos = Counter({
+        "habari": 10, "asante": 9, "sawa": 8, "tafadhali": 7, "nisaidie": 6,
+        "vipi": 6, "kwanini": 5, "je": 4,
+    })
+
+    def score(counter: Counter) -> float:
+        s = sum(counter.get(w, 0) for w in words)
+        s += sum(counter.get(bg, 0) for bg in bigrams)
+        return s / max(1.0, (len(words) ** 0.6))  # mild length normalization
+
+    krio_score = score(krio_pos)
+    sw_score = score(sw_pos)
+    en_penalty = sum(en_strong.get(w, 0) for w in words) / max(1, len(words))
+
+    # Decision thresholds
+    if krio_score > 3.5 and krio_score > sw_score * 1.6 and krio_score > en_penalty * 0.9:
+        conf = min(0.70 + 0.09 * krio_score, 0.96)
+        return "krio", conf
+
+    if sw_score > 4.0 and sw_score > krio_score * 1.6:
+        conf = min(0.70 + 0.11 * sw_score, 0.95)
+        return "sw", conf
+
+    if len(words) > 4 and en_penalty > 2.5 and krio_score < 3.8:
+        conf = min(0.68 + 0.07 * en_penalty, 0.94)
+        return "en", conf
+
+    # Fallback: word-boundary hits only (avoid substring matching)
+    krio_hits = 0
+    for k in krio_pos.keys():
+        if " " in k:
+            if k in bigrams:
+                krio_hits += 1
+        else:
+            if k in words:
+                krio_hits += 1
+
+    if krio_hits >= 2:
+        return "krio", min(0.62 + 0.08 * krio_hits, 0.90)
+
+    return "unknown", 0.40
 
 
-def normalize_krio(text: str) -> str:
+def normalize_krio(text: str, aggressive: bool = True) -> str:
     """
-    Krio cleanup / normalization BEFORE RAG.
-    - Does NOT translate the whole message
-    - Normalizes common tokens to improve retrieval/semantic matching
+    Normalize common Krio tokens to improve retrieval/semantic matching.
+    Aggressive mode applies more replacements; non-aggressive keeps original.
     """
     if not text:
+        return text
+
+    if not aggressive:
         return text
 
     replacements = {
@@ -103,39 +151,40 @@ def normalize_krio(text: str) -> str:
         "tori": "story",
         "wey": "that",
         "sef": "also",
+        "mek": "make",
+        "leh": "let",
     }
 
-    # Keep punctuation mostly intact, normalize word tokens only
     parts = text.split()
     out = []
     for token in parts:
         stripped = token.strip(".,!?;:()[]{}\"'")
         lower = stripped.lower()
         mapped = replacements.get(lower, stripped)
-
-        # Re-apply surrounding punctuation if any
-        out.append(token.replace(stripped, mapped, 1))
+        out.append(token.replace(stripped, mapped, 1) if stripped else token)
 
     return " ".join(out)
 
 
 def prepare_for_rag(user_text: str) -> Dict[str, Any]:
     """
-    Pre-RAG processing:
-    - Detect language
-    - If Krio, normalize before retrieval
-    Returns dict: {original, rag_text, lang, lang_confidence}
+    Pre-RAG processing pipeline:
+    - Detect language (analytics + behavior)
+    - If Krio, normalize before retrieval (configurable)
     """
     lang, conf = detect_language(user_text)
     rag_text = user_text
+
+    aggressive_norm = getattr(settings, "KRIO_NORMALIZE_AGGRESSIVE", True)
     if lang == "krio":
-        rag_text = normalize_krio(user_text)
+        rag_text = normalize_krio(user_text, aggressive=aggressive_norm)
 
     return {
         "original": user_text,
         "rag_text": rag_text,
         "lang": lang,
         "lang_confidence": conf,
+        "estimated_tokens": len(user_text) // 4 + 1,
     }
 
 
@@ -147,10 +196,6 @@ def language_analytics_payload(
     lang: Optional[str] = None,
     lang_confidence: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Returns a small payload you can store in Firestore/DB/logs.
-    Storage is done by caller (BotFlow), not here.
-    """
     if lang is None or lang_confidence is None:
         lang, lang_confidence = detect_language(raw_text)
 
@@ -160,24 +205,17 @@ def language_analytics_payload(
         "detected_language": lang,
         "language_confidence": float(lang_confidence),
         "timestamp_unix": int(time.time()),
+        "text_length": len(raw_text or ""),
     }
 
 
 def _language_ack_line(lang: str) -> str:
-    """
-    English-only acknowledgement line (do not translate).
-    """
-    if lang == "krio":
-        return "I understand your message was in Krio."
-    if lang == "sw":
-        return "I understand your message was in Swahili."
-    if lang == "en":
-        return ""  # no need to say it
-    return "I understand your message may be in another language."
+    # Product requirement: NO language acknowledgement line in user-facing responses
+    return ""
 
 
 # ============================================================
-# Chat Completion (ALWAYS English, acknowledge original language)
+# Chat Completion (English-only output, backward compatible)
 # ============================================================
 
 def chat_complete(
@@ -191,66 +229,82 @@ def chat_complete(
     detected_lang: Optional[str] = None,
 ) -> str:
     """
-    Create a chat completion.
+    Backward-compatible: returns ONLY the assistant content string.
+    If you want status/error info, use chat_complete_safe().
+    """
+    content, ok, _err = chat_complete_safe(
+        prompt,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        system_prompt=system_prompt,
+        source_text=source_text,
+        detected_lang=detected_lang,
+    )
+    return content if ok else ""
 
-    HARD RULES:
-    - ALWAYS respond in English only.
-    - Do not limit input languages.
-    - If input isn't English, acknowledge original language in English.
+
+def chat_complete_safe(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    source_text: Optional[str] = None,
+    detected_lang: Optional[str] = None,
+) -> Tuple[str, bool, str]:
+    """
+    Returns: (content, success, error_message)
     """
     client = get_openai()
 
-    use_model = model or getattr(settings, "LLM_MODEL", None) or settings.OPENAI_MODEL
-    use_temp = settings.LLM_TEMPERATURE if temperature is None else temperature
-    use_max_tokens = settings.LLM_MAX_TOKENS if max_tokens is None else max_tokens
-
-    # Determine language from source_text (preferred) else from prompt
-    base_text = source_text if source_text is not None else prompt
-    lang = detected_lang or detect_language(base_text)[0]
-    ack = _language_ack_line(lang)
-
-    enforced = (
-        "You are a helpful assistant.\n"
-        "IMPORTANT: Always respond in clear English only.\n"
-        "Never respond in any other language, even if the user writes in another language.\n"
-        "If the user's message is not English, begin the response with the acknowledgement line provided.\n"
-        "Be concise, accurate, and friendly.\n"
+    use_model = (
+        model
+        or getattr(settings, "LLM_MODEL", None)
+        or getattr(settings, "OPENAI_MODEL", None)
+        or "gpt-4o-mini"
     )
 
-    # If caller provided their own system_prompt, append it after our enforcement
-    if system_prompt:
-        enforced = enforced + "\n" + system_prompt
+    use_temp = getattr(settings, "LLM_TEMPERATURE", 0.3) if temperature is None else temperature
+    use_max_tokens = getattr(settings, "LLM_MAX_TOKENS", 350) if max_tokens is None else max_tokens
 
-    # Provide the acknowledgement line as an explicit instruction + content
-    # This makes it very hard for the model to “forget” it.
+    # Determine language for analytics/behavior only (NOT shown to user)
+    base_text = source_text if source_text is not None else prompt
+    _lang = detected_lang or detect_language(base_text)[0]  # intentionally unused in output
+
+    enforced = (
+        "You are a helpful, concise, and friendly assistant.\n"
+        "IMPORTANT: Always respond in clear, natural English only.\n"
+        "Never respond in any other language, even if the user writes in another language.\n"
+        "Do NOT add any language detection or language switching messages.\n"
+    )
+
+    if system_prompt:
+        enforced += "\n" + system_prompt
+
     messages = [
         {"role": "system", "content": enforced},
-        {"role": "system", "content": f"Acknowledgement line (use verbatim if non-English): {ack or '[none]'}"},
         {"role": "user", "content": prompt},
     ]
 
-    resp = _with_backoff(
-        client.chat.completions.create,
-        model=use_model,
-        messages=messages,
-        temperature=float(use_temp),
-        max_tokens=int(use_max_tokens),
-    )
-
     try:
+        resp = _with_backoff(
+            client.chat.completions.create,
+            model=use_model,
+            messages=messages,
+            temperature=float(use_temp),
+            max_tokens=int(use_max_tokens),
+        )
         content = (resp.choices[0].message.content or "").strip()
-    except Exception:
-        content = ""
-
-    # If ack is required but the model omitted it, prepend safely
-    if ack and content and not content.lower().startswith(ack.lower()):
-        content = f"{ack}\n\n{content}"
-
-    return content
+        return content, True, ""
+    except Exception as e:
+        msg = f"Chat completion failed ({use_model}): {str(e)}"
+        return "", False, msg
 
 
 # ============================================================
-# Audio Transcription (GPT-4o Transcribe, English+Krio friendly)
+# Audio Transcription (backward compatible)
 # ============================================================
 
 def whisper_transcribe(
@@ -261,14 +315,30 @@ def whisper_transcribe(
     prompt: Optional[str] = None,
 ) -> str:
     """
-    Transcribe voice notes to text.
+    Backward-compatible: returns ONLY the transcribed text string.
+    If you want status/error info, use whisper_transcribe_safe().
+    """
+    text, ok, _err = whisper_transcribe_safe(
+        audio_bytes,
+        filename=filename,
+        model=model,
+        prompt=prompt,
+    )
+    return text if ok else ""
 
-    Default model: gpt-4o-transcribe (your “4.o”) [1](https://medtroniclabsorg.sharepoint.com/sites/SPICEDevWorkflowReview/Shared%20Documents/Data%20and%20AI%20Product/Gen%20AI/Empowering%20Physicians/Empowering%20Physicians%20Analysis.pdf?web=1)[2](https://medtroniclabsorg.sharepoint.com/sites/SmartCare/_layouts/15/Doc.aspx?sourcedoc=%7B85C65A62-769D-4FA4-B7F0-9CB4E0D07ED2%7D&file=India-OpenPHC.pptx&action=edit&mobileredirect=true&DefaultItemOpen=1)
-    - Do NOT force language codes (Krio lacks ISO-639-1)
-    - Use a prompt hint to support English+Krio and avoid translation
+
+def whisper_transcribe_safe(
+    audio_bytes: bytes,
+    filename: str = "voice.ogg",
+    *,
+    model: Optional[str] = None,
+    prompt: Optional[str] = None,
+) -> Tuple[str, bool, str]:
+    """
+    Returns: (transcribed_text, success, error_message)
     """
     if not audio_bytes:
-        return ""
+        return "", False, "Empty audio input"
 
     client = get_openai()
 
@@ -278,74 +348,107 @@ def whisper_transcribe(
         or "gpt-4o-transcribe"
     )
 
+    # Prompt hardened to reduce hallucinations during long pauses/silence
     use_prompt = (
         prompt
         or getattr(settings, "TRANSCRIBE_PROMPT", None)
-        or "The speaker may use English or Krio. Transcribe faithfully without translating."
-    )
-
-    f = io.BytesIO(audio_bytes)
-    f.name = filename
-
-    resp = _with_backoff(
-        client.audio.transcriptions.create,
-        model=use_model,
-        file=f,
-        prompt=use_prompt,
+        or (
+            "The speaker may use English, Krio, or a mix of both. "
+            "Transcribe exactly what is spoken. "
+            "If there are long pauses or silence, do not generate filler or repetitive text. "
+            "Do not translate. Do not correct grammar."
+        )
     )
 
     try:
-        return (resp.text or "").strip()
-    except Exception:
-        return ""
+        f = io.BytesIO(audio_bytes)
+        f.name = filename
+
+        resp = _with_backoff(
+            client.audio.transcriptions.create,
+            model=use_model,
+            file=f,
+            prompt=use_prompt,
+            response_format="text",
+        )
+
+        # Some SDKs return an object with .text, others return plain text when response_format="text"
+        text = (getattr(resp, "text", resp) or "").strip()
+        return text, True, ""
+    except Exception as e:
+        msg = f"Transcription failed ({use_model}): {str(e)}"
+        return "", False, msg
 
 
 # ============================================================
-# Optional: Image analysis helper (only if you want it here)
-# If you already have analyze_image elsewhere, remove this.
+# Image Analysis (backward compatible)
 # ============================================================
 
-def analyze_image(image_bytes: bytes, mime_type: str, *, model: Optional[str] = None) -> str:
+def analyze_image(
+    image_bytes: bytes,
+    mime_type: str,
+    *,
+    model: Optional[str] = None,
+) -> str:
     """
-    Analyze an image and return a short English description that can be fed into RAG.
+    Backward-compatible: returns ONLY the description string.
+    If you want status/error info, use analyze_image_safe().
+    """
+    desc, ok, _err = analyze_image_safe(image_bytes, mime_type, model=model)
+    return desc if ok else ""
 
-    NOTE: If your project already defines analyze_image elsewhere, keep your existing one.
-    This is provided to match app.py import expectations.
+
+def analyze_image_safe(
+    image_bytes: bytes,
+    mime_type: str,
+    *,
+    model: Optional[str] = None,
+) -> Tuple[str, bool, str]:
+    """
+    Returns: (description, success, error_message)
     """
     if not image_bytes:
-        return ""
+        return "", False, "Empty image input"
 
     client = get_openai()
-    use_model = model or getattr(settings, "VISION_MODEL", None) or "gpt-4o-mini"
 
-    b64 = io.BytesIO(image_bytes).getvalue()
-    import base64 as _b64
-    data_url = f"data:{mime_type};base64,{_b64.b64encode(b64).decode('utf-8')}"
+    use_model = (
+        model
+        or getattr(settings, "VISION_MODEL", None)
+        or "gpt-4o-mini"
+    )
 
-    # Use chat.completions with image input format
+    import base64
+    data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+
     messages = [
         {
             "role": "system",
-            "content": "Describe the image content in English only, clearly and briefly. Do not translate user text; just describe what's visible."
+            "content": (
+                "You are an image analyzer. Describe the visible content in clear English only. "
+                "Be concise and factual. Do NOT translate any text in the image; describe what is written if relevant. "
+                "Focus on elements useful for support triage or understanding context."
+            )
         },
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "Describe the image for support triage."},
+                {"type": "text", "text": "Describe this image briefly for support context."},
                 {"type": "image_url", "image_url": {"url": data_url}},
             ],
         },
     ]
 
-    resp = _with_backoff(
-        client.chat.completions.create,
-        model=use_model,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=250,
-    )
-
     try:
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return ""
+        resp = _with_backoff(
+            client.chat.completions.create,
+            model=use_model,
+            messages=messages,
+            temperature=0.25,
+            max_tokens=300,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        return content, True, ""
+    except Exception as e:
+        msg = f"Image analysis failed ({use_model}): {str(e)}"
+        return "", False, msg
