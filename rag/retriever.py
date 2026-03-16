@@ -27,10 +27,10 @@ class Retriever:
 
         # Embedding client
         if self.use_openai:
-            from openai import OpenAI
             if not settings.OPENAI_API_KEY:
                 raise RuntimeError("OPENAI_API_KEY missing")
-            self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            from adapters.llm.openai_client import get_openai
+            self.client = get_openai()
         else:
             from sentence_transformers import SentenceTransformer
             self.st_model = SentenceTransformer(settings.HF_EMBED_MODEL)
@@ -105,7 +105,7 @@ class Retriever:
         return final
 
     # Backward compatibility
-    def search(self, query: str, top_k: int = None) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
         return self.retrieve(query, top_k=top_k)
 
     # ─────────────────────────────────────────────

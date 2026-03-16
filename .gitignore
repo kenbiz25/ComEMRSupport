@@ -28,4 +28,7 @@ KB/
 kb/
 
 # Ngrok session files
-*.ngrok.log
+*.ngrok.loglogs/
+core/memory/sessions/
+ComEMRSupport/
+logs/
