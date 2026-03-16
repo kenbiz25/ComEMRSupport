@@ -23,10 +23,6 @@ Thumbs.db
 # Docker artifacts
 *.pid
 
-# KB files (if sensitive)
-KB/
-kb/
-
 # Ngrok session files
 *.ngrok.loglogs/
 core/memory/sessions/
