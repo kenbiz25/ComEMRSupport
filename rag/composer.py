@@ -123,7 +123,7 @@ def _audio_to_text(audio_path: str) -> str:
     if openai:
         try:
             with open(audio_path, "rb") as f:
-                transcription = openai.Audio.transcriptions.create(file=f, model="whisper-1")
+                transcription = openai.audio.transcriptions.create(file=f, model="whisper-1")
             return transcription.text.strip()
         except Exception:
             pass

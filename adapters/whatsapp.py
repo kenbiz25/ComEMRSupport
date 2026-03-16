@@ -12,25 +12,24 @@ import os
 import requests
 from typing import Any, Dict, List, Optional
 
-# ---- Environment ----
-META_TOKEN: str = os.getenv("META_WHATSAPP_TOKEN", "")
-PHONE_ID: str   = os.getenv("WHATSAPP_PHONE_ID", "")
-API_VER: str    = os.getenv("WHATSAPP_API_VERSION", "v22.0")  # default to v22.0
-
 # ---- Internal helpers ----
 def _ensure_env() -> None:
-    if not META_TOKEN or not PHONE_ID:
+    token = os.getenv("META_WHATSAPP_TOKEN", "")
+    phone_id = os.getenv("WHATSAPP_PHONE_ID", "")
+    if not token or not phone_id:
         raise RuntimeError(
             "Missing META_WHATSAPP_TOKEN or WHATSAPP_PHONE_ID in environment variables."
         )
 
 def _messages_url() -> str:
     _ensure_env()
-    return f"https://graph.facebook.com/{API_VER}/{PHONE_ID}/messages"
+    api_ver = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    phone_id = os.getenv("WHATSAPP_PHONE_ID", "")
+    return f"https://graph.facebook.com/{api_ver}/{phone_id}/messages"
 
 def _headers() -> Dict[str, str]:
     return {
-        "Authorization": f"Bearer {META_TOKEN}",
+        "Authorization": f"Bearer {os.getenv('META_WHATSAPP_TOKEN', '')}",
         "Content-Type": "application/json",
     }
 

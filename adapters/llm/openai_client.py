@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import time
 import random
@@ -35,12 +36,18 @@ def _with_backoff(
     max_delay: float = 30.0,
     **kwargs
 ):
-    """Retry with exponential backoff + jitter for transient errors."""
+    """Retry with exponential backoff + jitter for transient errors only."""
+    try:
+        from openai import RateLimitError, APIConnectionError, APITimeoutError, InternalServerError
+        _retryable = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
+    except ImportError:
+        _retryable = (Exception,)
+
     delay = 1.0
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
-        except Exception:
+        except _retryable:
             if attempt == max_retries - 1:
                 raise
             sleep_for = delay + random.random() * 0.5
@@ -225,8 +232,6 @@ def chat_complete(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     system_prompt: Optional[str] = None,
-    source_text: Optional[str] = None,
-    detected_lang: Optional[str] = None,
 ) -> str:
     """
     Backward-compatible: returns ONLY the assistant content string.
@@ -238,8 +243,6 @@ def chat_complete(
         temperature=temperature,
         max_tokens=max_tokens,
         system_prompt=system_prompt,
-        source_text=source_text,
-        detected_lang=detected_lang,
     )
     return content if ok else ""
 
@@ -251,8 +254,6 @@ def chat_complete_safe(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     system_prompt: Optional[str] = None,
-    source_text: Optional[str] = None,
-    detected_lang: Optional[str] = None,
 ) -> Tuple[str, bool, str]:
     """
     Returns: (content, success, error_message)
@@ -268,10 +269,6 @@ def chat_complete_safe(
 
     use_temp = getattr(settings, "LLM_TEMPERATURE", 0.3) if temperature is None else temperature
     use_max_tokens = getattr(settings, "LLM_MAX_TOKENS", 350) if max_tokens is None else max_tokens
-
-    # Determine language for analytics/behavior only (NOT shown to user)
-    base_text = source_text if source_text is not None else prompt
-    _lang = detected_lang or detect_language(base_text)[0]  # intentionally unused in output
 
     enforced = (
         "You are a helpful, concise, and friendly assistant.\n"
@@ -418,7 +415,6 @@ def analyze_image_safe(
         or "gpt-4o-mini"
     )
 
-    import base64
     data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
 
     messages = [

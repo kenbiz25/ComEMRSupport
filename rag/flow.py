@@ -9,12 +9,17 @@ if TYPE_CHECKING:
 import logging
 import re
 
-try:
-    from spellchecker import SpellChecker
-except Exception:
-    SpellChecker = None
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# Availability flag only — do NOT instantiate at import time (slow disk load)
+try:
+    from spellchecker import SpellChecker as _SpellChecker
+    _SPELLCHECKER_AVAILABLE = True
+except Exception:
+    _SpellChecker = None  # type: ignore
+    _SPELLCHECKER_AVAILABLE = False
 
 
 class BotFlow:
@@ -37,8 +42,14 @@ class BotFlow:
         self.faiss = faiss_store
         self.llm = llm_service
         self.whatsapp = whatsapp_service
-        self.spell = SpellChecker() if SpellChecker else None
+        self._spell = None  # lazy-loaded on first use
         self._composer = composer
+
+    @property
+    def spell(self):
+        if self._spell is None and _SPELLCHECKER_AVAILABLE:
+            self._spell = _SpellChecker()
+        return self._spell
 
     def _get_composer(self):
         if self._composer:
@@ -220,10 +231,9 @@ class BotFlow:
         use_krio = self._detect_krio(raw)
         language = "krio" if use_krio else "en"
 
-        # --- Memory: always save the user's message (best-effort) ---
+        # --- Memory: always save the user’s message (best-effort) ---
         mem = None
         try:
-            from config.settings import settings
             if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and session_id:
                 mem = self._mem()
                 if mem:
@@ -233,7 +243,6 @@ class BotFlow:
 
         # If conversation was previously closed and user sends only a short ACK, ignore.
         try:
-            from config.settings import settings
             if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
                 recent = mem.get_recent(session_id, limit=10)
                 closed = any(m.get("role") == "system" and m.get("text") == "conversation_closed" for m in recent)
@@ -246,7 +255,6 @@ class BotFlow:
         if self._is_resolution_message(cleaned):
             outgoing = "Great — glad it’s working now. If you need anything else, just message me anytime."
             try:
-                from config.settings import settings
                 if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
                     mem.save_message(session_id, "assistant", outgoing)
                     mem.save_message(session_id, "system", "conversation_closed")
@@ -262,9 +270,8 @@ class BotFlow:
 
         # Closing messages -> single closing reply + close marker
         if self._is_closing_message(cleaned):
-            outgoing = "You're welcome — glad I could help. If you need anything else, just message me anytime."
+            outgoing = "You’re welcome — glad I could help. If you need anything else, just message me anytime."
             try:
-                from config.settings import settings
                 if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
                     mem.save_message(session_id, "assistant", outgoing)
                     mem.save_message(session_id, "system", "conversation_closed")
@@ -280,7 +287,6 @@ class BotFlow:
 
         # First-touch menu (only once per session)
         try:
-            from config.settings import settings
             if (
                 getattr(settings, "ENABLE_FIRST_TOUCH_MENU", True)
                 and getattr(settings, "ENABLE_CONVERSATION_MEMORY", False)
@@ -345,7 +351,6 @@ class BotFlow:
             answer = self.llm.generate_response(cleaned, docs, language=language)
 
             try:
-                from config.settings import settings
                 if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
                     mem.save_message(session_id, "assistant", answer)
             except Exception:
@@ -369,7 +374,6 @@ class BotFlow:
 
         # Handoff detection (kept as-is, but make sure it doesn't spam)
         try:
-            from config.settings import settings
             user_lower = (cleaned or "").strip().lower()
 
             explicit_re = re.compile(r"\b(connect me to support|please connect.*support|connect me to an agent|escalate to support)\b", re.I)
@@ -460,7 +464,6 @@ class BotFlow:
 
         # Save assistant response to memory (best-effort)
         try:
-            from config.settings import settings
             if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
                 mem.save_message(session_id, "assistant", outgoing)
         except Exception:
