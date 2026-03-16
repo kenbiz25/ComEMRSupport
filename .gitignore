@@ -31,3 +31,4 @@ kb/
 *.ngrok.loglogs/
 core/memory/sessions/
 ComEMRSupport/
+logs/
