@@ -146,6 +146,11 @@ class Settings:
     # Show a structured short menu on the first interaction for users who have difficulty typing
     ENABLE_FIRST_TOUCH_MENU = _to_bool(os.getenv("ENABLE_FIRST_TOUCH_MENU"), True)
 
+    # ==================== Ticketing ====================
+    ENABLE_TICKETING = _to_bool(os.getenv("ENABLE_TICKETING"), True)
+    # Path to the Excel file where tickets are saved
+    TICKET_FILE_PATH = os.getenv("TICKET_FILE_PATH", "tickets.xlsx")
+
     # ==================== Vector Memory / DB Backends ====================
     ENABLE_VECTOR_MEMORY = _to_bool(os.getenv("ENABLE_VECTOR_MEMORY"), True)
     ENABLE_ENCRYPTED_VECTOR_DB = _to_bool(os.getenv("ENABLE_ENCRYPTED_VECTOR_DB"), False)

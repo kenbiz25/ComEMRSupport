@@ -218,6 +218,39 @@ class BotFlow:
         except Exception:
             return None
 
+    # ------------------------------------------------------------------
+    # Ticket helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_ticket_yes(text: str) -> bool:
+        t = text.strip().lower()
+        return t in ("yes", "y", "yeah", "yep", "sure", "ok", "okay", "yep", "confirm")
+
+    @staticmethod
+    def _is_ticket_no(text: str) -> bool:
+        t = text.strip().lower()
+        return t in ("no", "n", "nope", "nah", "cancel", "never mind", "nevermind")
+
+    @staticmethod
+    def _extract_pending_issue(recent: list) -> str:
+        """Return the user message that triggered the ticket confirmation request."""
+        # Find the index of the ticket_pending marker
+        pending_idx = None
+        for i, m in enumerate(recent):
+            if m.get("role") == "system" and m.get("text") == "ticket_pending":
+                pending_idx = i
+
+        if pending_idx is None:
+            return "Issue not captured"
+
+        # Walk backwards to find the last user message before the marker
+        for m in reversed(recent[:pending_idx]):
+            if m.get("role") == "user":
+                return (m.get("text") or "")[:500]
+
+        return "Issue not captured"
+
     def handle_message(self, user_id: str, message: str, session_id: Optional[str] = None):
         """Main entrypoint called by the webhook to handle and respond to a message."""
         raw = message or ""
@@ -248,6 +281,56 @@ class BotFlow:
                 closed = any(m.get("role") == "system" and m.get("text") == "conversation_closed" for m in recent)
                 if closed and self._is_short_ack(raw):
                     return "", {"ignored": True}
+        except Exception:
+            pass
+
+        # --- Ticket confirmation: handle yes/no reply to a pending ticket request ---
+        try:
+            if (
+                getattr(settings, "ENABLE_TICKETING", True)
+                and getattr(settings, "ENABLE_CONVERSATION_MEMORY", False)
+                and mem
+                and session_id
+            ):
+                recent = mem.get_recent(session_id, limit=15)
+                ticket_pending = any(
+                    m.get("role") == "system" and m.get("text") == "ticket_pending"
+                    for m in recent
+                )
+                if ticket_pending:
+                    if self._is_ticket_yes(cleaned):
+                        issue = self._extract_pending_issue(recent)
+                        from core.tickets.ticket_manager import create_ticket
+                        ticket_id = create_ticket(user_id, issue)
+                        mem.save_message(session_id, "system", "ticket_created")
+                        if ticket_id:
+                            outgoing = (
+                                f"Your support ticket has been created.\n"
+                                f"Ticket ID: {ticket_id}\n"
+                                "Our team will review it and get back to you shortly."
+                            )
+                        else:
+                            outgoing = (
+                                "I tried to create a ticket but something went wrong on our end. "
+                                "Please contact support directly."
+                            )
+                        try:
+                            self.whatsapp.send_message(user_id, message=outgoing)
+                        except Exception:
+                            pass
+                        mem.save_message(session_id, "assistant", outgoing)
+                        return outgoing, {"ticket_created": bool(ticket_id), "ticket_id": ticket_id, "language": language}
+
+                    elif self._is_ticket_no(cleaned):
+                        mem.save_message(session_id, "system", "ticket_declined")
+                        outgoing = "No problem! Let me know if there's anything else I can help you with."
+                        try:
+                            self.whatsapp.send_message(user_id, message=outgoing)
+                        except Exception:
+                            pass
+                        mem.save_message(session_id, "assistant", outgoing)
+                        return outgoing, {"ticket_declined": True, "language": language}
+                    # else: ambiguous reply — fall through to normal RAG flow
         except Exception:
             pass
 
@@ -399,16 +482,29 @@ class BotFlow:
                     handoff = True
 
             if handoff:
-                outgoing = "Please hold — connecting you to a support agent now. I'll include a short summary so they can help you faster."
                 meta = meta or {}
                 meta["handoff"] = True
 
-                try:
-                    if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
-                        mem.save_message(session_id, "assistant", outgoing)
-                        mem.save_message(session_id, "system", "handoff_requested")
-                except Exception:
-                    pass
+                if getattr(settings, "ENABLE_TICKETING", True):
+                    outgoing = (
+                        "I wasn't able to fully resolve this for you. "
+                        "Would you like me to create a support ticket so our team can follow up? "
+                        "Reply Yes to confirm or No to cancel."
+                    )
+                    try:
+                        if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
+                            mem.save_message(session_id, "assistant", outgoing)
+                            mem.save_message(session_id, "system", "ticket_pending")
+                    except Exception:
+                        pass
+                else:
+                    outgoing = "Please hold — connecting you to a support agent now. I'll include a short summary so they can help you faster."
+                    try:
+                        if getattr(settings, "ENABLE_CONVERSATION_MEMORY", False) and mem and session_id:
+                            mem.save_message(session_id, "assistant", outgoing)
+                            mem.save_message(session_id, "system", "handoff_requested")
+                    except Exception:
+                        pass
 
                 try:
                     self.whatsapp.send_message(user_id, message=outgoing)
