@@ -1,23 +1,25 @@
-# ARCHIVED: This app has been moved to `archive/apps/whatsapp_gateway`.
-# If you need to restore it, copy files back from that directory.
+from fastapi import APIRouter, Request, HTTPException, Query, Response, UploadFile, File
+from config.settings import settings
+from config.logging import get_logger
+from config.rate_limit import allow
+from apps.whatsapp_gateway.send import send_whatsapp_text  # keep only this import
+from rag.composer import RagComposer
+from core.whatsapp.whatsapp_service import WhatsAppService
 
-__all__ = []
+# Helper to create a WhatsApp service using configured credentials
+def _create_whatsapp_service():
+    return WhatsAppService(settings.WHATSAPP_PHONE_ID, settings.META_WHATSAPP_TOKEN)
 
+router = APIRouter()
 
-def _archived_stub(*args, **kwargs):
-    raise RuntimeError("This module has been archived. See archive/apps/whatsapp_gateway for the original implementation.")
+# Include the webhook verification route
+log = get_logger("whatsapp")
 
-# Archived endpoint handlers removed to avoid import-time decorator errors.
-# The original implementations are available in `archive/apps/whatsapp_gateway/routes.py`.
+# Instantiate composer once; pass model + policy knobs
+composer = RagComposer(
+    llm_model=settings.LLM_MODEL,
+    safeguard=settings.SAFEGUARD_ENABLE,
+    top_k=getattr(settings, "TOP_K", 3),
+)
 
-# Module kept intentionally inert to avoid side-effects during import.
-__all__ = []
-
-
-def _archived_stub(*args, **kwargs):
-    raise RuntimeError("This module has been archived. See archive/apps/whatsapp_gateway for the original implementation.")
-
-router = None
-verify = _archived_stub
-inbound = _archived_stub
-upload_media_endpoint = _archived_stub
+# ...existing code...

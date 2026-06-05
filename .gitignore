@@ -32,3 +32,4 @@ logs/
 # Ticket files (stored in OneDrive, not in repo)
 tickets.xlsx
 *.tickets.xlsx
+core/faiss_index/
